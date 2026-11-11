@@ -1747,6 +1747,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # when encoder inputs are scheduled, because this step updates
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
+        if scheduler_output.repair_works is not None:
+            # Repair-only steps execute through execute_repair_only's
+            # native layer replay (eager by construction). Without this
+            # guard a repair step whose token count matches a captured
+            # piecewise graph would be dispatched PIECEWISE: the ordinary
+            # compiled forward would run over the repair batch and the
+            # dispatch below would raise (engine-fatal) -- the layer-
+            # limited replay cannot ride a compiled graph.
+            skip_compiled = True
 
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,

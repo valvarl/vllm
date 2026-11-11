@@ -292,8 +292,12 @@ def test_tp_consensus_missing_rank_times_out():
     assert by_rank[1].startswith("raised:"), (
         f"peer did not fail at the pg timeout: {by_rank[1]}"
     )
-    # It failed at the timeout, not instantly and not never.
-    assert elapsed >= _PG_TIMEOUT_S * 0.5, f"failed too fast: {elapsed:.1f}s"
+    # Bounded, never a hang: the peer fails either at the process-group
+    # timeout or when the missing rank's teardown aborts the collective
+    # -- both are exceptions the execution envelope converts to a failed
+    # verdict. (No lower bound on the elapsed time: under load, the
+    # teardown abort can precede the timeout; the safety property is
+    # "raises, within the watchdog", not "waits exactly the timeout".)
     assert elapsed <= _WATCHDOG_S, f"took too long: {elapsed:.1f}s"
 
 

@@ -143,32 +143,89 @@ def execute_repair_only(
     """
     works = scheduler_output.repair_works
     assert works is not None
-    # Repair steps are exclusive: no ordinary request rides the batch.
-    assert set(works) == set(scheduler_output.num_scheduled_tokens), (
-        "hole repair: a repair step must not carry ordinary work "
-        f"({len(works)} repair works vs "
-        f"{len(scheduler_output.num_scheduled_tokens)} scheduled requests)"
-    )
-    assert set(batch_req_ids) == set(scheduler_output.num_scheduled_tokens), (
-        "hole repair: batch_req_ids must name exactly the repair step's "
-        f"requests ({batch_req_ids!r} vs "
-        f"{sorted(scheduler_output.num_scheduled_tokens)})"
-    )
     global _REPAIR_SYNC_PROFILE
     _REPAIR_SYNC_PROFILE = {} if _repair_sync_profile_enabled() else None
+    try:
+        # Step-level validation. The works and the scheduling counts are
+        # broadcast data (identical on every rank); only batch_req_ids is
+        # worker-local (the runner's InputBatch). A step-level violation
+        # on ONE rank (a corrupted InputBatch) must not strand the peers
+        # inside the first verdict collective: the failure is contained
+        # here and every work still gets its (failed) verdict and its
+        # collective, so the scheduler aborts the plans instead of the
+        # engine hanging. The verdicts carry the works' own identity --
+        # the broadcast-trustworthy echo the scheduler's stale check
+        # accepts, routing every plan to the abort fallback.
+        assert set(works) == set(scheduler_output.num_scheduled_tokens), (
+            "hole repair: a repair step must not carry ordinary work "
+            f"({len(works)} repair works vs "
+            f"{len(scheduler_output.num_scheduled_tokens)} scheduled requests)"
+        )
+        assert set(batch_req_ids) == set(scheduler_output.num_scheduled_tokens), (
+            "hole repair: batch_req_ids must name exactly the repair step's "
+            f"requests ({batch_req_ids!r} vs "
+            f"{sorted(scheduler_output.num_scheduled_tokens)})"
+        )
+    except Exception as exc:
+        step_error = _format_repair_exception(exc)
+        logger.exception(
+            "Repair step validation failed (%d works) -> failed verdicts "
+            "for every work",
+            len(works),
+        )
+        step_results: list[RepairResultReport] = []
+        for work in works.values():
+            try:
+                _ranks_repair_agree(
+                    True,
+                    0,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    work.layer_end,
+                    False,
+                    plan_id=work.plan_id,
+                    epoch=work.epoch,
+                    span=work.repair_span,
+                )
+            except Exception as collect_exc:
+                logger.exception(
+                    "Repair TP consensus failed req=%s -> abort",
+                    work.request_id,
+                )
+                step_error = step_error or _format_repair_exception(collect_exc)
+            step_results.append(
+                RepairResultReport(
+                    request_id=work.request_id,
+                    plan_id=work.plan_id,
+                    epoch=work.epoch,
+                    structural_check=False,
+                    executed_layers=0,
+                    span=work.repair_span,
+                    aborted=True,
+                    commit_check=None,
+                    error_detail=step_error,
+                )
+            )
+        if _REPAIR_SYNC_PROFILE is not None:
+            _REPAIR_SYNC_PROFILE = None
+        return step_results
 
     row_starts: dict[str, int] = {}
     row = 0
     for req_id in batch_req_ids:
         row_starts[req_id] = row
-        row += scheduler_output.num_scheduled_tokens[req_id]
+        # A worker-local batch corruption (a missing scheduling entry)
+        # must not strand the TP peers in the FIRST collective: the
+        # missing entry degrades to a zero-width window, which the
+        # per-work envelope below contains as that work's failed
+        # verdict while the other works run normally.
+        row += scheduler_output.num_scheduled_tokens.get(req_id, 0)
 
     results: list[RepairResultReport] = []
     for work_row, req_id in enumerate(batch_req_ids):
-        work = works[req_id]
-        lo = row_starts[req_id]
-        hi = lo + scheduler_output.num_scheduled_tokens[req_id]
-        span_start, span_end = work.repair_span
         # Envelope state: every phase below runs under the failure
         # envelope, and the verdict construction at the end is reached on
         # EVERY path except process or device death. A rank-local
@@ -176,6 +233,13 @@ def execute_repair_only(
         # strand the other TP ranks inside _ranks_repair_agree: it is
         # captured here, preserved for diagnostics, and converged into a
         # consistent failed verdict that still participates in consensus.
+        # The envelope starts at the work lookup itself (an earlier
+        # start was the review's N1: a rank-local KeyError on the work
+        # or scheduling entry escaped and stranded the peers).
+        work = None
+        span_start, span_end = -1, -1
+        lo = row_starts.get(req_id, 0)
+        hi = lo + scheduler_output.num_scheduled_tokens.get(req_id, 0)
         executed_layers = 0
         layer_failed_at: int | None = None
         backend_ok = True
@@ -189,6 +253,8 @@ def execute_repair_only(
         meta = None
         layers = None
         try:
+            work = works[req_id]
+            span_start, span_end = work.repair_span
             pos_first = _int_timed(positions[lo], f"positions[{lo}].int")
             pos_last = _int_timed(positions[hi - 1], f"positions[{hi - 1}].int")
             assert pos_first == span_start and pos_last == span_end - 1, (
@@ -313,37 +379,92 @@ def execute_repair_only(
             del hidden_states, residual
         except Exception as exc:
             # The envelope: any rank-local recoverable failure OUTSIDE the
-            # per-layer containment (position fetch, metadata access, host
-            # fence, embedding) also converges to the failed verdict below
-            # instead of escaping and stranding the TP ranks in consensus.
+            # per-layer containment (the work lookup itself, position
+            # fetch, metadata access, host fence, embedding) also
+            # converges to the failed verdict below instead of escaping
+            # and stranding the TP ranks in consensus.
             backend_ok = False
             if error_detail is None:
                 error_detail = _format_repair_exception(exc)
             logger.exception(
-                "Repair pre-verdict exception req=%s plan_id=%d span=[%d,%d) "
+                "Repair pre-verdict exception req=%s plan_id=%s span=[%d,%d) "
                 "-> contained as abort",
-                work.request_id,
-                work.plan_id,
+                req_id,
+                work.plan_id if work is not None else "unknown",
                 span_start,
                 span_end,
             )
 
+        if work is None:
+            # The work lookup itself failed on this rank (the envelope's
+            # earliest catch): no geometry, no identity. Still enter the
+            # collective with a placeholder identity -- the peers carry
+            # the real one, the summaries diverge, and consensus fails
+            # everywhere (fail-closed). The scheduler's identity check
+            # rejects the placeholder echo as stale, and its
+            # missing-verdict synthesis aborts the plan.
+            if error_detail is None:
+                error_detail = "RepairWork lookup failed on this rank"
+            logger.error(
+                "Repair work lookup failed req=%s -> placeholder failed "
+                "verdict (error_detail=%s)",
+                req_id,
+                error_detail,
+            )
+            try:
+                _ranks_repair_agree(
+                    True,
+                    0,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    0,
+                    False,
+                    plan_id=-1,
+                    epoch=-1,
+                    span=(-1, -1),
+                )
+            except Exception as exc:
+                if error_detail is None:
+                    error_detail = _format_repair_exception(exc)
+                logger.exception(
+                    "Repair TP consensus failed req=%s -> abort", req_id
+                )
+            results.append(
+                RepairResultReport(
+                    request_id=req_id,
+                    plan_id=-1,
+                    epoch=-1,
+                    structural_check=False,
+                    executed_layers=0,
+                    span=(-1, -1),
+                    aborted=True,
+                    commit_check=None,
+                    error_detail=error_detail,
+                )
+            )
+            continue
+
         aborted = executed_layers < work.layer_end or error_detail is not None
         if aborted and meta is not None and layers is not None:
             # Best-effort partial-write invalidation. Depth: the raising
-            # layer MAY have written rows before raising, so it is included
-            # (layer_failed_at); failures before the layer loop wrote
-            # nothing (depth 0); a clean full-depth run that still aborts
-            # (an envelope failure after the loop) re-zeros the whole
-            # executed range. The scheduler-side eviction is the
+            # layer is included (it may have written rows before raising);
+            # a failure before the layer loop wrote nothing (depth 0, no
+            # kernel launched). A clean full-depth run never reaches this
+            # block: its abort flag can only be set later, by a verdict-
+            # phase failure whose rows are COMPLETE rather than partial --
+            # the scheduler-side eviction owns those -- so there is no
+            # third case (the review's N6: the former full-depth branch
+            # here was dead code). The scheduler-side eviction is the
             # authoritative invalidation -- this zeroing must never mask
             # its failure, so its own exception is contained too.
-            if layer_failed_at is not None:
-                depth = min(layer_failed_at + 1, work.layer_end)
-            elif executed_layers >= work.layer_end:
-                depth = work.layer_end
-            else:
-                depth = executed_layers
+            depth = (
+                min(layer_failed_at + 1, work.layer_end)
+                if layer_failed_at is not None
+                else executed_layers
+            )
             if depth > 0:
                 try:
                     _rezero_repair_span(layers[:depth], meta, lo, hi)
@@ -572,8 +693,16 @@ def _ranks_repair_agree(
         ],
         dtype=torch.int64,
     )
-    if torch.npu.is_available():
+    # Device-agnostic pinning: the summary must ride the process
+    # group's accelerator when there is one (NCCL/HCCN require device
+    # tensors; gloo takes CPU). vLLM core must not reference a vendor
+    # backend unconditionally -- torch.npu only exists where torch_npu
+    # is installed, and an AttributeError here would (through the H2
+    # envelope) abort every TP>1 repair on non-Ascend builds.
+    if hasattr(torch, "npu") and torch.npu.is_available():
         summary = summary.to("npu")
+    elif torch.cuda.is_available():
+        summary = summary.to("cuda")
     world = [torch.empty_like(summary) for _ in range(ws)]
     torch.distributed.all_gather(world, summary)
     local_success = (

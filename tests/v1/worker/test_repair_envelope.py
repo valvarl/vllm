@@ -304,3 +304,112 @@ def test_error_detail_preserves_original_exception_type_and_message():
     assert rb.error_detail is not None
     assert rb.error_detail.startswith("ValueError:")
     assert "very specific kernel failure xyz" in rb.error_detail
+
+# ---- H6: the review-response hardening ----
+
+
+def test_step_level_validation_failure_still_verdicts():
+    """A step-level violation (a worker-local InputBatch corruption --
+    here: batch_req_ids naming a foreign request) must not escape before
+    the first collective and strand the TP peers: every work still gets
+    its failed verdict (carrying the work's own identity, so the
+    scheduler's stale check routes it to the abort fallback) and its
+    collective."""
+    works, tokens, positions, input_ids, meta = _multi_work_setup()
+    model = _FakeModel(n_layers=4)
+    collected = []
+    with patch(
+        "torch.distributed.all_gather", _counting_all_gather(collected)
+    ), _fake_tp_ctx():
+        results = _run(
+            model, works, tokens, positions, input_ids, meta,
+            ["req-a", "req-b", "req-FORBIDDEN"],
+        )
+
+    assert len(results) == 2
+    assert all(r.aborted and not r.structural_check for r in results)
+    # The works' own identity: the scheduler's echo check accepts these
+    # verdicts (routing to abort), not the stale path.
+    assert [r.plan_id for r in results] == [1, 2]
+    assert [r.span for r in results] == [(0, BS), (BS, 2 * BS)]
+    assert all(r.error_detail is not None for r in results)
+    # One collective per work, unconditional.
+    assert len(collected) == 2
+
+
+def test_work_lookup_failure_converges_to_placeholder_verdict():
+    """The envelope's earliest per-work catch (the review's N1): a work
+    lookup that fails on one rank only (a raising mapping -- the shape a
+    worker-local corruption produces under PYTHONOPTIMIZE, where the
+    step-level asserts are stripped) converges to a placeholder failed
+    verdict whose collective still runs; the healthy work-mate is
+    unaffected."""
+    works, tokens, positions, input_ids, meta = _multi_work_setup()
+    model = _FakeModel(n_layers=4)
+
+    class _BoomWorks(dict):
+        def __getitem__(self, key):
+            if key == "req-a":
+                raise KeyError(key)
+            return super().__getitem__(key)
+
+    boom_works = _BoomWorks(works)
+    # Bypass _sub_output: it copies the works into a plain dict, which
+    # would defeat the raising mapping. Build the SchedulerOutput with
+    # the mapping itself.
+    from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+
+    sub = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens=dict(tokens),
+        total_num_scheduled_tokens=sum(tokens.values()),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+        repair_works=boom_works,
+    )
+    collected = []
+    with patch(
+        "torch.distributed.all_gather", _counting_all_gather(collected)
+    ), _fake_tp_ctx():
+        with set_forward_context(
+            {"model.layers.0": meta},
+            create_vllm_config(model="unsloth/Llama-3.2-1B"),
+        ):
+            results = execute_repair_only(
+                model, sub, input_ids, positions, ["req-a", "req-b"]
+            )
+
+    ra, rb = results
+    # req-a: placeholder failed verdict -- no identity, aborted, the
+    # lookup failure recorded.
+    assert ra.aborted and not ra.structural_check
+    assert ra.plan_id == -1 and ra.span == (-1, -1)
+    assert ra.commit_check is None
+    # The original exception (the lookup KeyError) is preserved as the
+    # diagnostic of record.
+    assert "KeyError" in (ra.error_detail or "")
+    # req-b: healthy mate unaffected.
+    assert not rb.aborted and rb.structural_check
+    # Both collectives ran, in work order.
+    assert len(collected) == 2
+
+
+def test_need_eager_forces_none_cudagraph_mode():
+    """The dispatch lever the repair step guard uses (the review's F5):
+    need_eager=True forces CUDAGraphMode.NONE -- repair-only steps must
+    never ride a compiled graph. The model_runner wiring
+    (repair_works is not None -> skip_compiled -> need_eager) mirrors
+    the encoder-decoder precedent directly above it and is verified by
+    inspection (building a real cudagraph manager needs a GPU); this
+    pins the dispatch contract the wiring depends on."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+
+    batch_desc, _ = dispatch_cg_and_sync_dp(
+        None, 1, 16, None, 1, 0, need_eager=True
+    )
+    assert batch_desc.cg_mode == CUDAGraphMode.NONE
