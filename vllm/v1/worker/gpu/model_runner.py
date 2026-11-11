@@ -71,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
+    KVConnectorOutput,
     ModelRunnerOutput,
 )
 from vllm.v1.watermarking import create_watermarker
@@ -125,6 +126,7 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
+from vllm.v1.worker.kv_connector_model_runner_mixin import execute_repair_only
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -1205,11 +1207,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
+            if num_computed_tokens != num_computed_tokens_np[req_index]:
+                # The scheduler's count moved since its last echo (a
+                # load-failure rollback or a repair commit restoration).
+                # The GPU-side count only advances optimistically, so the
+                # authoritative value must be staged over.
+                self.req_states.num_computed_tokens.stage_write_elem(
+                    req_index, num_computed_tokens
+                )
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None and req_id not in table_updates:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+        self.req_states.num_computed_tokens.apply_write()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -1957,6 +1968,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Run model.
+        repair_results = None
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -2002,11 +2014,55 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.cudagraph_manager.run_pw_graph(
                         self.model, model_inputs
                     )
+                elif scheduler_output.repair_works is not None:
+                    # Repair-only step, exclusive by construction: every
+                    # scheduled request is a repair work (eager mode only).
+                    # The replay's output is discarded; the verdicts ride
+                    # the step's connector output.
+                    repair_results = execute_repair_only(
+                        self.model,
+                        scheduler_output,
+                        model_inputs["input_ids"],
+                        model_inputs["positions"],
+                        list(input_batch.req_ids),
+                    )
+                    model_output = None
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+
+        if scheduler_output.repair_works is not None:
+            # No logits, no sampling, no output publication for the repair
+            # step: the connector output (with the repair verdicts) is the
+            # step's whole product. The scheduled requests are named so
+            # update_from_output can settle their in-flight accounting
+            # without consuming any tokens.
+            if repair_results is None:
+                raise RuntimeError(
+                    "A repair step ran without the repair execution path "
+                    "(cudagraph modes do not support repair yet)."
+                )
+            kv_connector_output = self.kv_connector.post_forward(
+                scheduler_output.finished_req_ids
+            )
+            if kv_connector_output is None:
+                kv_connector_output = KVConnectorOutput()
+            kv_connector_output.repair_results = repair_results
+            model_runner_output = ModelRunnerOutput(
+                req_ids=list(scheduler_output.repair_works.keys()),
+                req_id_to_index={
+                    req_id: i
+                    for i, req_id in enumerate(scheduler_output.repair_works)
+                },
+                sampled_token_ids=None,  # type: ignore[arg-type]
+                logprobs=None,
+                prompt_logprobs_dict={},  # type: ignore[arg-type]
+                prompt_token_id_logprobs_dict={},  # type: ignore[arg-type]
+            )
+            model_runner_output.kv_connector_output = kv_connector_output
+            return model_runner_output
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
