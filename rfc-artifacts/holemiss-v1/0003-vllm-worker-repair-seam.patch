@@ -1,0 +1,1056 @@
+diff --git a/tests/v1/worker/test_repair_commit_checks.py b/tests/v1/worker/test_repair_commit_checks.py
+new file mode 100644
+index 0000000..28e51b0
+--- /dev/null
++++ b/tests/v1/worker/test_repair_commit_checks.py
+@@ -0,0 +1,425 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Hole-repair commit checks (worker side, pure host shapes).
++
++Unit surface for the exclusive repair-only execution: the
++duplicate-detecting slot-coverage check (a multiset comparison -- a
++duplicated slot in the coverage is a write-aliasing hazard a set
++comparison silently passes), the pre-write ownership fence, abort
++containment, and the live-getenv sync-profile gate.
++"""
++
++from dataclasses import dataclass
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from tests.v1.kv_connector.unit.utils import create_vllm_config
++from vllm.forward_context import set_forward_context
++from vllm.v1.core.sched.output import (
++    CachedRequestData,
++    RepairWork,
++    SchedulerOutput,
++)
++from vllm.v1.outputs import RepairResultReport
++from vllm.v1.worker.kv_connector_model_runner_mixin import (
++    _repair_sync_profile_enabled,
++    _slots_cover_span,
++    _slots_owned_by_request,
++    execute_repair_only,
++)
++
++pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
++
++BS = 128
++BLOCK_TABLE = [7, 9]
++
++
++@dataclass
++class _FakeMeta:
++    block_tables: list
++    slot_mapping: torch.Tensor
++
++
++def _meta(slots: torch.Tensor) -> _FakeMeta:
++    return _FakeMeta(block_tables=[torch.tensor(BLOCK_TABLE)], slot_mapping=slots)
++
++
++def _span_slots(block_idx: int) -> torch.Tensor:
++    return torch.arange(block_idx * BS, (block_idx + 1) * BS, dtype=torch.int64)
++
++
++def test_span_slot_coverage_accepts_exact_mapping():
++    slots = _span_slots(BLOCK_TABLE[1])
++    assert _slots_cover_span(_meta(slots), BS, 1 * BS, 2 * BS)
++    assert _slots_owned_by_request(_meta(slots), BS)
++
++
++def test_span_slot_coverage_detects_missing_and_foreign_slots():
++    missing = _span_slots(BLOCK_TABLE[1]).clone()
++    missing[10] = 4096 + 5  # a foreign slot displaces an expected row
++    assert not _slots_cover_span(_meta(missing), BS, 1 * BS, 2 * BS)
++    assert not _slots_owned_by_request(_meta(missing), BS)
++
++
++def test_span_slot_coverage_detects_duplicated_slot():
++    """A slot mapping with an EXTRA duplicated row (a mis-built metadata
++    emitting one token twice) covers every expected slot exactly once
++    plus the alias: the set comparison passes it, the multiset comparison
++    must not."""
++    clean = _span_slots(BLOCK_TABLE[1])
++    duplicated = torch.cat([clean, clean[:1]])
++
++    assert _slots_cover_span(_meta(clean), BS, 1 * BS, 2 * BS)
++    assert not _slots_cover_span(_meta(duplicated), BS, 1 * BS, 2 * BS)
++
++
++def test_sync_profile_gate_defaults_off(monkeypatch):
++    """The sync profiler runs only under its live-getenv gate; the
++    production commit path pays no profiling."""
++    monkeypatch.delenv("KV_REPAIR_SYNC_PROFILE", raising=False)
++    assert not _repair_sync_profile_enabled()
++
++    monkeypatch.setenv("KV_REPAIR_SYNC_PROFILE", "1")
++    assert _repair_sync_profile_enabled()
++
++
++# ---- The multi-item repair-only step: one verdict per work ----
++
++
++class _FakeLayer:
++    def __init__(self, layer_name: str):
++        attn = SimpleNamespace(
++            kv_cache=[
++                torch.zeros(4, BS, 8),
++                torch.zeros(4, BS, 8),
++            ],
++            layer_name=layer_name,
++        )
++        self.self_attn = SimpleNamespace(attn=attn)
++
++    def __call__(self, positions, hidden_states, residual):
++        return hidden_states + 1.0, residual
++
++
++class _FakeInner:
++    def __init__(self, layers):
++        self.layers = layers
++
++    def embed_input_ids(self, input_ids):
++        return torch.zeros(input_ids.shape[0], 8)
++
++
++class _FakeModel:
++    def __init__(self, n_layers: int):
++        self.model = _FakeInner(
++            [_FakeLayer(f"model.layers.{i}") for i in range(n_layers)]
++        )
++
++
++def _sub_output(works, tokens):
++    base = dict(
++        scheduled_new_reqs=[],
++        scheduled_cached_reqs=CachedRequestData.make_empty(),
++        num_scheduled_tokens=dict(tokens),
++        total_num_scheduled_tokens=sum(tokens.values()),
++        scheduled_spec_decode_tokens={},
++        scheduled_encoder_inputs={},
++        num_common_prefix_blocks=[],
++        finished_req_ids=set(),
++        free_encoder_mm_hashes=[],
++    )
++    return SchedulerOutput(repair_works=dict(works), **base)
++
++
++def _multi_work_setup():
++    """Two repair works in one repair-only step: req-a spans [0, 128) at
++    rows [0, 128) with layer_end 1; req-b spans [128, 256) at rows
++    [128, 256) with layer_end 2. The fake metadata's block tables carry
++    one row per request and the slot mapping covers both works' slots."""
++    works = {
++        "req-a": RepairWork(
++            request_id="req-a",
++            repair_span=(0, BS),
++            layer_end=1,
++            restored_extent=512,
++            plan_id=1,
++            epoch=7,
++            # The scheduler-authoritative write set: req-a's span block.
++            expected_write_block_ids=(2,),
++        ),
++        "req-b": RepairWork(
++            request_id="req-b",
++            repair_span=(BS, 2 * BS),
++            layer_end=2,
++            restored_extent=512,
++            plan_id=2,
++            epoch=7,
++            expected_write_block_ids=(3,),
++        ),
++    }
++    tokens = {"req-a": BS, "req-b": BS}
++    positions = torch.arange(2 * BS, dtype=torch.int64)
++    input_ids = torch.arange(2 * BS, dtype=torch.int64)
++    # req-a's span [0, 128) is its table's block 0 (block id 2); req-b's
++    # span [128, 256) is its table's block 1 (block id 3).
++    meta = _FakeMeta(
++        block_tables=[torch.tensor([2]), torch.tensor([8, 3])],
++        slot_mapping=torch.cat([_span_slots(2), _span_slots(3)]),
++    )
++    return works, tokens, positions, input_ids, meta
++
++
++def test_execute_repair_only_multi_item_executes_each_work():
++    """One repair-only step carrying two repair works executes each work
++    item -- its own row window, its own layer range, its own commit
++    battery -- and the results come back as a list, one verdict per
++    work."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    sub = _sub_output(works, tokens)
++    model = _FakeModel(n_layers=4)
++
++    with set_forward_context(
++        {"model.layers.0": meta}, create_vllm_config(model="unsloth/Llama-3.2-1B")
++    ):
++        results = execute_repair_only(
++            model, sub, input_ids, positions, ["req-a", "req-b"]
++        )
++
++    assert [r.request_id for r in results] == ["req-a", "req-b"]
++    # Per-work layer ranges: req-a executed 1 layer, req-b executed 2.
++    assert results[0].executed_layers == 1
++    assert results[1].executed_layers == 2
++    assert [r.plan_id for r in results] == [1, 2]
++    assert [r.span for r in results] == [(0, BS), (BS, 2 * BS)]
++    # The commit battery applies per work item under the shared step.
++    assert all(r.structural_check for r in results)
++    assert results[0].commit_check is not None
++    assert results[1].commit_check is not None
++
++
++def test_pre_write_gate_refuses_foreign_slot_before_any_layer():
++    """A slot mapping whose window points at a FOREIGN block (not in the
++    work's own block-table row) is refused BEFORE any layer executes --
++    zero cache-writing kernels run for that work, the verdict carries the
++    gate refusal, and the OTHER works in the step are unaffected."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    # Corrupt req-a's slot window: its 128 slots now target block 999
++    # (foreign -- not in either table row).
++    bad_slots = meta.slot_mapping.clone()
++    bad_slots[:BS] = 999 * BS + torch.arange(BS)
++    meta_bad = _FakeMeta(block_tables=meta.block_tables, slot_mapping=bad_slots)
++    sub = _sub_output(works, tokens)
++    model = _FakeModel(n_layers=4)
++
++    with set_forward_context(
++        {"model.layers.0": meta_bad}, create_vllm_config(model="unsloth/Llama-3.2-1B")
++    ):
++        results = execute_repair_only(
++            model, sub, input_ids, positions, ["req-a", "req-b"]
++        )
++
++    ra, rb = results
++    # req-a: the gate refused -- ZERO layers executed, aborted, the gate
++    # key in the commit check, structural_check False.
++    assert ra.executed_layers == 0
++    assert ra.aborted
++    assert ra.commit_check["pre_write_geometry"] is False
++    assert ra.commit_check["slot_ownership"] is False
++    assert not ra.structural_check
++    # req-b: unaffected -- its own geometry was valid.
++    assert rb.executed_layers == 2
++    assert not rb.aborted
++    assert rb.commit_check["pre_write_geometry"] is True
++    assert rb.structural_check
++
++
++def test_layer_exception_contained_as_abort():
++    """An arbitrary exception inside the repair stream is request-local:
++    the stream stops, the partial writes' layer count is reported, the
++    verdict is ABORT with backend_ok False -- the engine does not crash
++    and no success is fabricated."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    sub = _sub_output(works, tokens)
++    model = _FakeModel(n_layers=4)
++    # Layer 1 raises for every caller; req-a (layer_end=1) never reaches
++    # it, req-b (layer_end=2) hits it on its second layer.
++    class _BoomLayer(_FakeLayer):
++        def __call__(self, positions, hidden_states, residual):
++            raise RuntimeError("injected device-side failure")
++
++    model.model.layers[1] = _BoomLayer("model.layers.1")
++
++    with set_forward_context(
++        {"model.layers.0": meta}, create_vllm_config(model="unsloth/Llama-3.2-1B")
++    ):
++        results = execute_repair_only(
++            model, sub, input_ids, positions, ["req-a", "req-b"]
++        )
++
++    ra, rb = results
++    assert ra.executed_layers == 1
++    assert not ra.aborted
++    assert ra.structural_check
++    assert rb.executed_layers == 1  # stopped at the raising layer
++    assert rb.aborted
++    assert rb.commit_check["backend_ok"] is False
++    assert not rb.structural_check
++
++
++def test_execute_repair_only_per_work_positions_validation():
++    """The per-work validation RED twin: work req-b's row window carries
++    positions that do not match its repair span -- the per-work positions
++    assert must fire (the multi-item loop may not skip or weaken any
++    item's battery)."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    # Corrupt req-b's window: its positions no longer match [128, 256).
++    positions = positions.clone()
++    positions[BS:] = positions[BS:] + BS
++    sub = _sub_output(works, tokens)
++    model = _FakeModel(n_layers=4)
++
++    with pytest.raises(AssertionError, match="req-b"):
++        with set_forward_context(
++            {"model.layers.0": meta},
++            create_vllm_config(model="unsloth/Llama-3.2-1B"),
++        ):
++            execute_repair_only(
++                model, sub, input_ids, positions, ["req-a", "req-b"]
++            )
++
++
++# ---- The ownership fence: the independent authorization battery ----
++
++
++def _run_two_works(model, works, tokens, positions, input_ids, meta):
++    sub = _sub_output(works, tokens)
++    with set_forward_context(
++        {"model.layers.0": meta}, create_vllm_config(model="unsloth/Llama-3.2-1B")
++    ):
++        return execute_repair_only(
++            model, sub, input_ids, positions, ["req-a", "req-b"]
++        )
++
++
++def test_correlated_metadata_corruption_refused():
++    """BOTH of req-a's worker structures (the block-table row AND the
++    slot window) consistently point at req-b's physical block while the
++    work carries req-a's true scheduler authorization. The self-
++    referential gate accepts this geometry; the independent
++    authorization must refuse it before any repair layer runs, with
++    req-b unaffected."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    corrupted = _FakeMeta(
++        block_tables=[torch.tensor([8]), torch.tensor([8, 3])],
++        slot_mapping=torch.cat([_span_slots(8), _span_slots(3)]),
++    )
++    results = _run_two_works(
++        _FakeModel(n_layers=4), works, tokens, positions, input_ids, corrupted
++    )
++    ra, rb = results
++    assert ra.executed_layers == 0
++    assert ra.aborted
++    assert ra.commit_check["authorized_ownership"] is False
++    assert ra.commit_check["authorized_table"] is False
++    assert ra.commit_check["pre_write_geometry"] is False
++    assert not ra.structural_check
++    # The honest neighbor is unaffected.
++    assert rb.executed_layers == 2
++    assert rb.structural_check
++
++
++def test_swapped_authorization_refused():
++    """The swap: req-a's work carries REQ-B's authorization. The honest
++    req-a worker geometry cannot reproduce a foreign authorization's
++    slots -- refused, and req-b (whose own authorization is correct) is
++    unaffected."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    works["req-a"].expected_write_block_ids = (3,)  # req-b's block!
++    results = _run_two_works(
++        _FakeModel(n_layers=4), works, tokens, positions, input_ids, meta
++    )
++    ra, rb = results
++    assert ra.executed_layers == 0
++    assert ra.commit_check["authorized_ownership"] is False
++    assert not ra.structural_check
++    assert rb.executed_layers == 2
++
++
++def test_missing_authorization_fail_closed():
++    """The fail-closed default: a work with NO authorization snapshot (an
++    unbuild/stale shape) is never executable."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    works["req-a"].expected_write_block_ids = ()
++    results = _run_two_works(
++        _FakeModel(n_layers=4), works, tokens, positions, input_ids, meta
++    )
++    ra = results[0]
++    assert ra.executed_layers == 0
++    assert ra.commit_check["authorized_ownership"] is False
++    assert ra.commit_check["pre_write_geometry"] is False
++
++
++def test_partial_write_set_authorization_refused():
++    """A two-block repair span whose authorization omits the second
++    (healthy, replayed-because-rollback-below) block: the expected slot
++    multiset misses half the span -- refused."""
++    work = RepairWork(
++        request_id="req-a",
++        repair_span=(0, 2 * BS),
++        layer_end=1,
++        restored_extent=512,
++        plan_id=1,
++        epoch=7,
++        expected_write_block_ids=(2,),  # omits block 9!
++    )
++    meta = _FakeMeta(
++        # req-a's row covers blocks 0-1 (2, 9); req-b's row must cover
++        # its span's ABSOLUTE block index 2 (a 3-entry row: the row
++        # lists the request's blocks from ITS block 0).
++        block_tables=[torch.tensor([2, 9]), torch.tensor([11, 12, 3])],
++        slot_mapping=torch.cat([_span_slots(2), _span_slots(9), _span_slots(3)]),
++    )
++    works = {
++        "req-a": work,
++        "req-b": RepairWork(
++            request_id="req-b",
++            repair_span=(2 * BS, 3 * BS),
++            layer_end=1,
++            restored_extent=512,
++            plan_id=2,
++            epoch=7,
++            expected_write_block_ids=(3,),
++        ),
++    }
++    tokens = {"req-a": 2 * BS, "req-b": BS}
++    positions = torch.arange(3 * BS, dtype=torch.int64)
++    input_ids = positions.clone()
++    results = _run_two_works(
++        _FakeModel(n_layers=4), works, tokens, positions, input_ids, meta
++    )
++    ra = results[0]
++    assert ra.executed_layers == 0
++    assert ra.commit_check["authorized_ownership"] is False
++    assert not ra.structural_check
++
++
++def test_duplicated_slots_refused_under_authorization():
++    """The slot window carries a duplicated slot and a displaced one (the
++    same length, all inside req-a's own authorized block): the multiset
++    comparison against the authorization must refuse."""
++    works, tokens, positions, input_ids, meta = _multi_work_setup()
++    dup = _span_slots(2).clone()
++    dup[5] = dup[4]  # duplicate; dup[5]'s expected slot goes missing
++    corrupted = _FakeMeta(
++        block_tables=[torch.tensor([2]), torch.tensor([8, 3])],
++        slot_mapping=torch.cat([dup, _span_slots(3)]),
++    )
++    results = _run_two_works(
++        _FakeModel(n_layers=4), works, tokens, positions, input_ids, corrupted
++    )
++    ra = results[0]
++    assert ra.executed_layers == 0
++    assert ra.commit_check["authorized_ownership"] is False
++    assert not ra.structural_check
+diff --git a/vllm/v1/worker/gpu/kv_connector.py b/vllm/v1/worker/gpu/kv_connector.py
+index 1ba75be..bfdfb8b 100644
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -109,6 +109,7 @@ class ActiveKVConnector(KVConnector):
+         output.finished_recving = transfer_results.finished_recving or None
+         output.failed_recving = transfer_results.failed_recving
+         output.invalid_block_ids = self.kv_connector.get_block_ids_with_load_errors()
++        output.load_failure_reports = self.kv_connector.get_load_failure_reports()
+         output.kv_connector_stats = self.kv_connector.get_kv_connector_stats()
+         output.kv_cache_events = self.kv_connector.get_kv_connector_kv_cache_events()
+         output.kv_connector_worker_meta = (
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c2f2997..05f0a84 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -71,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
+ from vllm.v1.outputs import (
+     DraftTokenIds,
+     ECConnectorOutput,
++    KVConnectorOutput,
+     ModelRunnerOutput,
+ )
+ from vllm.v1.watermarking import create_watermarker
+@@ -125,6 +126,7 @@ from vllm.v1.worker.gpu.kv_connector import (
+     KVConnector,
+     get_kv_connector,
+ )
++from vllm.v1.worker.kv_connector_model_runner_mixin import execute_repair_only
+ from vllm.v1.worker.gpu.lora_utils import (
+     LoraState,
+     create_lora_capture_hook,
+@@ -1205,11 +1207,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
+         ):
+             req_index = self.req_states.req_id_to_index[req_id]
++            if num_computed_tokens != num_computed_tokens_np[req_index]:
++                # The scheduler's count moved since its last echo (a
++                # load-failure rollback or a repair commit restoration).
++                # The GPU-side count only advances optimistically, so the
++                # authoritative value must be staged over.
++                self.req_states.num_computed_tokens.stage_write_elem(
++                    req_index, num_computed_tokens
++                )
+             num_computed_tokens_np[req_index] = num_computed_tokens
+             if req_new_block_ids is not None and req_id not in table_updates:
+                 self.block_tables.append_block_ids(
+                     req_index, req_new_block_ids, overwrite=False
+                 )
++        self.req_states.num_computed_tokens.apply_write()
+ 
+         # Update CPU num_computed_prefill_tokens.
+         np.minimum(
+@@ -1957,6 +1968,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+ 
+         # Run model.
++        repair_results = None
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             # Use explicit cudagraph replay for FULL mode.
+             # NOTE(woosuk): Here, we don't need to pass the input tensors,
+@@ -2002,12 +2014,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     model_output = self.cudagraph_manager.run_pw_graph(
+                         self.model, model_inputs
+                     )
++                elif scheduler_output.repair_works is not None:
++                    # Repair-only step, exclusive by construction: every
++                    # scheduled request is a repair work (eager mode only).
++                    # The replay's output is discarded; the verdicts ride
++                    # the step's connector output.
++                    repair_results = execute_repair_only(
++                        self.model,
++                        scheduler_output,
++                        model_inputs["input_ids"],
++                        model_inputs["positions"],
++                        list(input_batch.req_ids),
++                    )
++                    model_output = None
+                 else:
+                     # Eager (NONE): call the raw model directly.
+                     model_output = self.model(**model_inputs)
+ 
+         self.kv_connector.finish_forward()
+ 
++        if scheduler_output.repair_works is not None:
++            # No logits, no sampling, no output publication for the repair
++            # step: the connector output (with the repair verdicts) is the
++            # step's whole product. The scheduled requests are named so
++            # update_from_output can settle their in-flight accounting
++            # without consuming any tokens.
++            if repair_results is None:
++                raise RuntimeError(
++                    "A repair step ran without the repair execution path "
++                    "(cudagraph modes do not support repair yet)."
++                )
++            kv_connector_output = self.kv_connector.post_forward(
++                scheduler_output.finished_req_ids
++            )
++            if kv_connector_output is None:
++                kv_connector_output = KVConnectorOutput()
++            kv_connector_output.repair_results = repair_results
++            model_runner_output = ModelRunnerOutput(
++                req_ids=list(scheduler_output.repair_works.keys()),
++                req_id_to_index={
++                    req_id: i
++                    for i, req_id in enumerate(scheduler_output.repair_works)
++                },
++                sampled_token_ids=None,  # type: ignore[arg-type]
++                logprobs=None,
++                prompt_logprobs_dict={},  # type: ignore[arg-type]
++                prompt_token_id_logprobs_dict={},  # type: ignore[arg-type]
++            )
++            model_runner_output.kv_connector_output = kv_connector_output
++            return model_runner_output
++
+         if self.is_last_pp_rank:
+             if self.use_aux_hidden_state_outputs:
+                 assert isinstance(model_output, tuple)
+diff --git a/vllm/v1/worker/kv_connector_model_runner_mixin.py b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+index 40382b5..905e849 100644
+--- a/vllm/v1/worker/kv_connector_model_runner_mixin.py
++++ b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+@@ -2,22 +2,31 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Define KV connector functionality mixin for model runners."""
+ 
++import os
++import time
++from collections import Counter
+ from collections.abc import Generator
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Any
++
++import torch
+ 
+ from vllm.config import VllmConfig
+ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+ from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+ from vllm.forward_context import get_forward_context, set_forward_context
++from vllm.logger import init_logger
+ from vllm.v1.outputs import (
+     KVConnectorOutput,
+     ModelRunnerOutput,
++    RepairResultReport,
+ )
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.core.sched.output import SchedulerOutput
+ 
++logger = init_logger(__name__)
++
+ 
+ # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
+ class KVConnectorModelRunnerMixin:
+@@ -98,6 +107,9 @@ class KVConnectorModelRunnerMixin:
+             output.finished_recving = transfer_results.finished_recving
+             output.failed_recving = transfer_results.failed_recving
+             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
++            output.load_failure_reports = (
++                kv_connector.get_load_failure_reports()
++            )
+ 
+             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
+             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
+@@ -105,3 +117,459 @@ class KVConnectorModelRunnerMixin:
+ 
+             if not defer_finalize:
+                 kv_connector.clear_connector_metadata()
++
++
++def execute_repair_only(
++    model: Any,
++    scheduler_output: "SchedulerOutput",
++    input_ids: torch.Tensor,
++    positions: torch.Tensor,
++    batch_req_ids: list[str],
++) -> list[RepairResultReport]:
++    """Execute the repair works of one exclusive repair-only step.
++
++    Runs native layer.forward over each work item's repair span for
++    layers [0, layer_end) only, discards the output (no logits, no
++    sampling), and returns one verdict per work for the caller to attach
++    to the step's connector output. Must be called inside the live
++    forward context (the caller's execute_model) with the runner's own
++    preprocessed inputs; every scheduled request in the step is a repair
++    work (the step is exclusive by construction).
++
++    Each work item's rows are its own window of the step's batch
++    (batch_req_ids is the row order), each item runs its own layer
++    range, and the validation battery (positions, slot ownership, write
++    coverage, layer coverage) applies per work item.
++    """
++    works = scheduler_output.repair_works
++    assert works is not None
++    # Repair steps are exclusive: no ordinary request rides the batch.
++    assert set(works) == set(scheduler_output.num_scheduled_tokens), (
++        "hole repair: a repair step must not carry ordinary work "
++        f"({len(works)} repair works vs "
++        f"{len(scheduler_output.num_scheduled_tokens)} scheduled requests)"
++    )
++    assert set(batch_req_ids) == set(scheduler_output.num_scheduled_tokens), (
++        "hole repair: batch_req_ids must name exactly the repair step's "
++        f"requests ({batch_req_ids!r} vs "
++        f"{sorted(scheduler_output.num_scheduled_tokens)})"
++    )
++    global _REPAIR_SYNC_PROFILE
++    _REPAIR_SYNC_PROFILE = {} if _repair_sync_profile_enabled() else None
++
++    row_starts: dict[str, int] = {}
++    row = 0
++    for req_id in batch_req_ids:
++        row_starts[req_id] = row
++        row += scheduler_output.num_scheduled_tokens[req_id]
++
++    results: list[RepairResultReport] = []
++    for work_row, req_id in enumerate(batch_req_ids):
++        work = works[req_id]
++        lo = row_starts[req_id]
++        hi = lo + scheduler_output.num_scheduled_tokens[req_id]
++        span_start, span_end = work.repair_span
++        pos_first = _int_timed(positions[lo], f"positions[{lo}].int")
++        pos_last = _int_timed(positions[hi - 1], f"positions[{hi - 1}].int")
++        assert pos_first == span_start and pos_last == span_end - 1, (
++            f"hole repair: physical positions [{pos_first},"
++            f"{pos_last}] do not match the repair span "
++            f"[{span_start}, {span_end}) of {req_id}"
++        )
++
++        layers = model.model.layers
++        assert work.layer_end <= len(layers), (
++            f"hole repair: layer_end {work.layer_end} exceeds the stack "
++            f"({len(layers)} layers)"
++        )
++
++        attn_metadata = get_forward_context().attn_metadata
++        assert isinstance(attn_metadata, dict) and attn_metadata
++        meta = next(iter(attn_metadata.values()))
++        block_size = layers[0].self_attn.attn.kv_cache[0].shape[1]
++
++        # Pre-write safety gate: the slot window and the block-table row
++        # are fetched once to the host (a single D2H per work item -- the
++        # same lists feed the post-write attestation) and the geometry is
++        # validated BEFORE the first cache-writing kernel, so a malformed
++        # slot mapping can never write into another request's KV.
++        slots_host = _tolist_timed(
++            meta.slot_mapping[lo:hi], "pre_write.slot_mapping.tolist"
++        )
++        block_table_host = _tolist_timed(
++            meta.block_tables[work_row], "pre_write.block_tables.tolist"
++        )
++        # Ownership fence: the expected physical blocks come from the WORK
++        # (the scheduler snapshotted them from KVCacheManager at the
++        # admission), NOT from this worker's metadata. The expected
++        # physical slots are reconstructed from the authorization and
++        # compared against the ACTUAL slot mapping: two
++        # consistently-corrupted worker structures (the block table and
++        # the slot mapping both pointing at a foreign request's blocks)
++        # cannot reproduce the authorized slot multiset, so the foreign
++        # write is refused.
++        auth_blocks = tuple(work.expected_write_block_ids)
++        auth_present = bool(auth_blocks)
++        span_blocks = -(-(span_end - span_start) // block_size)
++        # The authorization must cover exactly the span's blocks: a
++        # partial or over-long snapshot is malformed -- refused, never a
++        # crash.
++        auth_len_ok = len(auth_blocks) == span_blocks
++        expected_slots = Counter()
++        if auth_present and auth_len_ok:
++            first_blk = span_start // block_size
++            for tok in range(span_start, span_end):
++                block_id = auth_blocks[(tok // block_size) - first_blk]
++                expected_slots[block_id * block_size + tok % block_size] += 1
++        auth_slots_ok = (
++            auth_present and auth_len_ok and Counter(slots_host) == expected_slots
++        )
++        # The worker block table's span slice must AGREE with the
++        # authorization (an independent check of the row itself).
++        table_span = block_table_host[
++            span_start // block_size : -(-span_end // block_size)
++        ]
++        auth_table_ok = auth_present and list(table_span) == list(auth_blocks)
++        pre_write_ownership = _slots_owned_by_request_list(
++            slots_host, block_table_host, block_size
++        )
++        pre_write_coverage = _slots_cover_span_list(
++            slots_host, block_table_host, span_start, span_end, block_size
++        )
++        pre_write_ok = (
++            pre_write_ownership
++            and pre_write_coverage
++            and auth_present
++            and auth_slots_ok
++            and auth_table_ok
++        )
++        if not pre_write_ok:
++            logger.error(
++                "Repair pre-write fence refused req=%s plan_id=%d "
++                "span=[%d,%d) ownership=%s coverage=%s auth_present=%s "
++                "auth_slots=%s auth_table=%s -- no cache write executed",
++                work.request_id,
++                work.plan_id,
++                span_start,
++                span_end,
++                pre_write_ownership,
++                pre_write_coverage,
++                auth_present,
++                auth_slots_ok,
++                auth_table_ok,
++            )
++
++        hidden_states = model.model.embed_input_ids(input_ids[lo:hi])
++        residual = None
++        executed_layers = 0
++        backend_ok = True
++        if pre_write_ok:
++            for idx, layer in enumerate(layers[: work.layer_end]):
++                try:
++                    hidden_states, residual = layer(
++                        positions[lo:hi], hidden_states, residual
++                    )
++                except Exception:
++                    # Exception containment: a failure inside the repair
++                    # stream is request-local. Stop the stream here, re-zero
++                    # the executed layers' partial writes (the abort handler
++                    # below), report the failure, and let the scheduler's
++                    # recompute fallback own the request. A poisoned device
++                    # context fails loudly at the next step; a successful
++                    # transaction is never fabricated.
++                    logger.exception(
++                        "Repair layer exception req=%s idx=%d span=[%d,%d) "
++                        "-> contained as abort",
++                        work.request_id,
++                        idx,
++                        span_start,
++                        span_end,
++                    )
++                    backend_ok = False
++                    break
++                executed_layers += 1
++        del hidden_states, residual
++
++        aborted = executed_layers < work.layer_end
++        if aborted:
++            _rezero_repair_span(layers[:executed_layers], meta, lo, hi)
++
++        commit_check = {
++            "transfer_complete": not aborted,
++            # The post-write attestation reuses the pre-write host lists
++            # (the slot mapping is immutable across the forward): the
++            # executed writes targeted exactly this request's blocks and
++            # exactly the span; the pre-write gate above is what PREVENTED
++            # a malformed geometry from ever executing.
++            "pre_write_geometry": pre_write_ok,
++            "authorized_ownership": auth_present and auth_slots_ok,
++            "authorized_table": auth_table_ok,
++            "slot_ownership": pre_write_ownership,
++            "write_coverage": pre_write_coverage,
++            "layer_coverage": executed_layers == work.layer_end,
++            "backend_ok": backend_ok,
++            # TP consensus, fail-closed: every rank executes the SAME works
++            # (the SchedulerOutput is broadcast) and all-gathers its packed
++            # verdict summary. The transaction commits only when every rank
++            # agrees and succeeded -- a single failed or divergent rank
++            # aborts the transaction on EVERY rank, never the driver's
++            # verdict alone.
++            "ranks_agree": _ranks_repair_agree(
++                aborted, executed_layers, pre_write_ok,
++                auth_present and auth_slots_ok, auth_table_ok,
++                pre_write_ownership, pre_write_coverage,
++                work.layer_end, backend_ok,
++            ),
++            "identity_ok": work.plan_id >= 0 and work.epoch >= 0,
++        }
++        structural_check = all(commit_check.values())
++        result = RepairResultReport(
++            request_id=work.request_id,
++            plan_id=work.plan_id,
++            epoch=work.epoch,
++            structural_check=structural_check,
++            executed_layers=executed_layers,
++            span=(span_start, span_end),
++            aborted=aborted,
++            commit_check=commit_check,
++        )
++        logger.info(
++            "Repair executed req=%s plan_id=%d epoch=%d span=[%d,%d) "
++            "layer_end=%d executed_layers=%d aborted=%s "
++            "structural_check=%s attn_state=%s",
++            work.request_id,
++            work.plan_id,
++            work.epoch,
++            span_start,
++            span_end,
++            work.layer_end,
++            executed_layers,
++            aborted,
++            structural_check,
++            str(getattr(meta, "attn_state", None)),
++        )
++        results.append(result)
++    if _REPAIR_SYNC_PROFILE is not None:
++        profile = {k: round(v * 1e3, 3) for k, v in _REPAIR_SYNC_PROFILE.items()}
++        logger.info(
++            "Repair sync profile total_ms=%.3f ops=%s",
++            sum(profile.values()),
++            profile,
++        )
++        _REPAIR_SYNC_PROFILE = None
++    return results
++
++
++# Per-repair-step sync profile: {label: accumulated seconds}. None (the
++# production default) makes the _*_timed helpers pass-through calls.
++_REPAIR_SYNC_PROFILE: dict[str, float] | None = None
++
++
++def _repair_sync_profile_enabled() -> bool:
++    return os.environ.get("KV_REPAIR_SYNC_PROFILE") == "1"
++
++
++def _tolist_timed(t: torch.Tensor, label: str) -> list:
++    if _REPAIR_SYNC_PROFILE is None:
++        return t.tolist()
++    t0 = time.perf_counter()
++    out = t.tolist()
++    _record_sync(label, time.perf_counter() - t0)
++    return out
++
++
++def _item_timed(t: torch.Tensor, label: str) -> int:
++    if _REPAIR_SYNC_PROFILE is None:
++        return int(t)
++    t0 = time.perf_counter()
++    out = int(t)
++    _record_sync(label, time.perf_counter() - t0)
++    return out
++
++
++def _int_timed(t: torch.Tensor, label: str) -> int:
++    return _item_timed(t, label)
++
++
++def _record_sync(label: str, seconds: float) -> None:
++    _REPAIR_SYNC_PROFILE[label] = _REPAIR_SYNC_PROFILE.get(label, 0.0) + seconds
++
++
++def _tp_world_size() -> int:
++    if torch.distributed.is_initialized():
++        return torch.distributed.get_world_size()
++    return 1
++
++
++def _ranks_repair_agree(
++    aborted: bool,
++    executed_layers: int,
++    pre_write_ok: bool,
++    auth_ownership_ok: bool,
++    auth_table_ok: bool,
++    slot_ownership: bool,
++    write_coverage: bool,
++    layer_end: int,
++    backend_ok: bool,
++) -> bool:
++    """The TP cross-rank repair agreement (fail-closed).
++
++    Every rank executes the same repair works and reaches its own local
++    verdict. Each rank packs its verdict summary into one int64 tensor
++    and all-gathers it: the transaction succeeds only when EVERY rank's
++    summary is identical to the local one AND every rank's summary is a
++    success (not aborted, full layer coverage, all local checks green).
++    A single failed or divergent rank aborts the transaction on every
++    rank -- the driver's verdict alone never commits.
++    """
++    ws = _tp_world_size()
++    if ws <= 1:
++        return True
++    summary = torch.tensor(
++        [
++            int(aborted),
++            int(executed_layers),
++            int(pre_write_ok),
++            int(auth_ownership_ok),
++            int(auth_table_ok),
++            int(slot_ownership),
++            int(write_coverage),
++            int(layer_end),
++            int(backend_ok),
++        ],
++        dtype=torch.int64,
++    )
++    if torch.npu.is_available():
++        summary = summary.to("npu")
++    world = [torch.empty_like(summary) for _ in range(ws)]
++    torch.distributed.all_gather(world, summary)
++    local_success = (
++        not aborted
++        and executed_layers == layer_end
++        and pre_write_ok
++        and auth_ownership_ok
++        and auth_table_ok
++        and slot_ownership
++        and write_coverage
++        and backend_ok
++    )
++    for remote in world:
++        if not torch.equal(remote, summary):
++            return False
++        remote_success = (
++            remote[0].item() == 0
++            and int(remote[1].item()) == int(remote[7].item())
++            and all(int(remote[i].item()) == 1 for i in (2, 3, 4, 5, 6, 8))
++        )
++        if not remote_success:
++            return False
++    return local_success
++
++
++def _slots_owned_by_request_list(
++    slots_host: list[int], block_table_host: list[int], block_size: int
++) -> bool:
++    """Ownership check over the host-side slot and block-table lists:
++    every span slot lives inside a block the work's own block-table row
++    names."""
++    owned = set(block_table_host)
++    return all((s // block_size) in owned for s in slots_host)
++
++
++def _slots_cover_span_list(
++    slots_host: list[int],
++    block_table_host: list[int],
++    span_start: int,
++    span_end: int,
++    block_size: int,
++) -> bool:
++    """Multiset coverage check over the host-side lists: the expected
++    slots are derived from the block table per span token and the actual
++    slot window must match exactly (a duplicated slot aliases two tokens
++    onto one cache row). The block table row lists the request's blocks
++    from its block 0, so the absolute block index (tok // block_size)
++    indexes it directly."""
++    expected = Counter()
++    for tok in range(span_start, span_end):
++        block_id = block_table_host[tok // block_size]
++        expected[block_id * block_size + tok % block_size] += 1
++    return Counter(slots_host) == expected
++
++
++def _slots_owned_by_request(
++    meta, block_size: int, row: int = 0, lo: int = 0, hi: int | None = None
++) -> bool:
++    """Commit-check element: every span slot lives inside a block the
++    request's own block table names. ``row`` is the work item's row in
++    the step's block tables; the slot window is the item's [lo, hi) rows
++    of the step's slot mapping."""
++    owned = {
++        int(b)
++        for b in _tolist_timed(
++            meta.block_tables[row], f"ownership.block_tables.tolist"
++        )
++    }
++    slots = meta.slot_mapping if hi is None else meta.slot_mapping[lo:hi]
++    for s in _tolist_timed(slots, "ownership.slot_mapping.tolist"):
++        if int(s) // block_size not in owned:
++            return False
++    return True
++
++
++def _slots_cover_span(
++    meta,
++    block_size: int,
++    span_start: int,
++    span_end: int,
++    row: int = 0,
++    lo: int = 0,
++    hi: int | None = None,
++) -> bool:
++    """Commit-check element: the work item's slot window covers exactly
++    the span's slots, each expected row exactly once. A multiset
++    comparison: a duplicated slot (two tokens aliased to one cache row,
++    silently losing one row's KV) must fail the check, which a set
++    comparison passes. ``row`` is the item's block-table row; the actual
++    slots are the item's [lo, hi) rows of the step's slot mapping."""
++    expected = Counter()
++    block_table = meta.block_tables[row]
++    for tok in range(span_start, span_end):
++        block_idx = tok // block_size
++        block_id = _item_timed(
++            block_table[block_idx], "coverage_expected.item"
++        )
++        expected[block_id * block_size + tok % block_size] += 1
++    slots = meta.slot_mapping if hi is None else meta.slot_mapping[lo:hi]
++    actual = Counter(
++        int(s) for s in _tolist_timed(slots, "coverage.slot_mapping.tolist")
++    )
++    return actual == expected
++
++
++def _rezero_repair_span(layers, meta, lo: int = 0, hi: int | None = None) -> None:
++    """Abort-path partial-write invalidation: re-zero the span's slot rows
++    in every executed layer's K and V cache. A partial repair is not a
++    valid prefix; no partial content is left readable.
++
++    The write indexes the cache tensor's own [block, offset] dims: the
++    per-layer cache can be a non-contiguous view (a reshape would copy,
++    and the zero would land in the copy). The slot window is the work
++    item's [lo, hi) rows of the step's slot mapping."""
++    slots = meta.slot_mapping if hi is None else meta.slot_mapping[lo:hi]
++    slots = slots.long()
++    max_abs_after = 0.0
++    for layer in layers:
++        attn = layer.self_attn.attn
++        block_size = attn.kv_cache[0].shape[1]
++        bidx = slots // block_size
++        oidx = slots % block_size
++        for cache in attn.kv_cache:
++            cache[bidx, oidx] = 0
++        k_rows = attn.kv_cache[0][bidx, oidx]
++        max_abs_after = max(max_abs_after, float(k_rows.abs().max()))
++    logger.info(
++        "Repair abort re-zero layers=%d rows=%d max_abs_after=%.6f",
++        len(layers),
++        int(slots.numel()),
++        max_abs_after,
++    )
