@@ -329,25 +329,37 @@ def execute_repair_only(
             )
 
         aborted = executed_layers < work.layer_end or error_detail is not None
-        if aborted and meta is not None and layers is not None and executed_layers > 0:
-            # Best-effort partial-write invalidation of the fully
-            # executed layers' rows. The scheduler-side eviction is the
+        if aborted and meta is not None and layers is not None:
+            # Best-effort partial-write invalidation. Depth: the raising
+            # layer MAY have written rows before raising, so it is included
+            # (layer_failed_at); failures before the layer loop wrote
+            # nothing (depth 0); a clean full-depth run that still aborts
+            # (an envelope failure after the loop) re-zeros the whole
+            # executed range. The scheduler-side eviction is the
             # authoritative invalidation -- this zeroing must never mask
             # its failure, so its own exception is contained too.
-            try:
-                _rezero_repair_span(layers[:executed_layers], meta, lo, hi)
-            except Exception as exc:
-                if error_detail is None:
-                    error_detail = _format_repair_exception(exc)
-                logger.exception(
-                    "Repair abort re-zero failed req=%s plan_id=%d "
-                    "span=[%d,%d) (scheduler-side eviction "
-                    "remains the authoritative invalidation)",
-                    work.request_id,
-                    work.plan_id,
-                    span_start,
-                    span_end,
-                )
+            if layer_failed_at is not None:
+                depth = min(layer_failed_at + 1, work.layer_end)
+            elif executed_layers >= work.layer_end:
+                depth = work.layer_end
+            else:
+                depth = executed_layers
+            if depth > 0:
+                try:
+                    _rezero_repair_span(layers[:depth], meta, lo, hi)
+                except Exception as exc:
+                    if error_detail is None:
+                        error_detail = _format_repair_exception(exc)
+                    logger.exception(
+                        "Repair abort re-zero failed req=%s plan_id=%d "
+                        "span=[%d,%d) depth=%d (scheduler-side eviction "
+                        "remains the authoritative invalidation)",
+                        work.request_id,
+                        work.plan_id,
+                        span_start,
+                        span_end,
+                        depth,
+                    )
 
         ranks_agree = False
         try:
