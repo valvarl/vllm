@@ -269,10 +269,13 @@ def test_layer_exception_contained_as_abort():
 
 
 def test_execute_repair_only_per_work_positions_validation():
-    """The per-work validation RED twin: work req-b's row window carries
-    positions that do not match its repair span -- the per-work positions
-    assert must fire (the multi-item loop may not skip or weaken any
-    item's battery)."""
+    """The per-work validation twin: work req-b's row window carries
+    positions that do not match its repair span. Under the hardening
+    envelope (H2) the per-work assertion no longer escapes the executor
+    -- it converges to a FAILED verdict for the malformed work (the
+    original AssertionError preserved in error_detail) while the
+    well-formed work-mate still succeeds: a rank-local geometry mismatch
+    must not strand the TP ranks in the verdict collective."""
     works, tokens, positions, input_ids, meta = _multi_work_setup()
     # Corrupt req-b's window: its positions no longer match [128, 256).
     positions = positions.clone()
@@ -280,14 +283,22 @@ def test_execute_repair_only_per_work_positions_validation():
     sub = _sub_output(works, tokens)
     model = _FakeModel(n_layers=4)
 
-    with pytest.raises(AssertionError, match="req-b"):
-        with set_forward_context(
-            {"model.layers.0": meta},
-            create_vllm_config(model="unsloth/Llama-3.2-1B"),
-        ):
-            execute_repair_only(
-                model, sub, input_ids, positions, ["req-a", "req-b"]
-            )
+    with set_forward_context(
+        {"model.layers.0": meta},
+        create_vllm_config(model="unsloth/Llama-3.2-1B"),
+    ):
+        results = execute_repair_only(
+            model, sub, input_ids, positions, ["req-a", "req-b"]
+        )
+
+    ra, rb = results
+    assert not ra.aborted and ra.structural_check
+    assert rb.aborted
+    assert not rb.structural_check
+    assert rb.executed_layers == 0
+    assert rb.error_detail is not None
+    assert "AssertionError" in rb.error_detail
+    assert "req-b" in rb.error_detail
 
 
 # ---- The ownership fence: the independent authorization battery ----
