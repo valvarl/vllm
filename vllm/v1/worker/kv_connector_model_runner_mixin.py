@@ -381,6 +381,9 @@ def execute_repair_only(
                 pre_write_coverage,
                 work.layer_end,
                 backend_ok,
+                plan_id=work.plan_id,
+                epoch=work.epoch,
+                span=work.repair_span,
             )
         except Exception as exc:
             # The collective itself failed (process-group error, or a
@@ -517,20 +520,40 @@ def _ranks_repair_agree(
     write_coverage: bool,
     layer_end: int,
     backend_ok: bool,
+    plan_id: int = -1,
+    epoch: int = -1,
+    span: tuple[int, int] = (-1, -1),
 ) -> bool:
     """The TP cross-rank repair agreement (fail-closed).
 
     Every rank executes the same repair works and reaches its own local
-    verdict. Each rank packs its verdict summary into one int64 tensor
+    verdict. Each rank packs its verdict summary -- the outcome flags AND
+    the work's identity (plan_id, epoch, span) -- into one int64 tensor
     and all-gathers it: the transaction succeeds only when EVERY rank's
     summary is identical to the local one AND every rank's summary is a
     success (not aborted, full layer coverage, all local checks green).
     A single failed or divergent rank aborts the transaction on every
-    rank -- the driver's verdict alone never commits.
+    rank -- the driver's verdict alone never commits. The identity fields
+    make a rank executing stale or foreign work (a divergent broadcast,
+    a replayed schedule) abort on every rank instead of committing a
+    verdict whose geometry happened to agree.
     """
     ws = _tp_world_size()
     if ws <= 1:
-        return True
+        # Uniform semantics: with one rank, "every rank agrees and
+        # succeeded" reduces to the local summary being a success --
+        # the same predicate the multi-rank loop derives from the
+        # gathered summaries.
+        return (
+            not aborted
+            and executed_layers == layer_end
+            and pre_write_ok
+            and auth_ownership_ok
+            and auth_table_ok
+            and slot_ownership
+            and write_coverage
+            and backend_ok
+        )
     summary = torch.tensor(
         [
             int(aborted),
@@ -542,6 +565,10 @@ def _ranks_repair_agree(
             int(write_coverage),
             int(layer_end),
             int(backend_ok),
+            int(plan_id),
+            int(epoch),
+            int(span[0]),
+            int(span[1]),
         ],
         dtype=torch.int64,
     )
@@ -570,6 +597,8 @@ def _ranks_repair_agree(
         if not remote_success:
             return False
     return local_success
+
+
 def _slots_owned_by_request_list(
     slots_host: list[int], block_table_host: list[int], block_size: int
 ) -> bool:
