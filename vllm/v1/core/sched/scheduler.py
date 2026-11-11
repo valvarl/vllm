@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
@@ -44,6 +45,7 @@ from vllm.v1.core.sched.output import (
     GrammarOutput,
     KVConnectorBlockState,
     NewRequestData,
+    RepairWork,
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
@@ -66,7 +68,13 @@ from vllm.v1.metrics.stats import (
     RequestSpecDecodeMetrics,
     SchedulerStats,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    DraftTokenIds,
+    KVConnectorOutput,
+    KVLoadFailureReport,
+    ModelRunnerOutput,
+    RepairResultReport,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -74,6 +82,57 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class RecoveryPlan:
+    """Scheduler-owned admission state for one damaged request (the
+    hole-recovery ``repair`` policy). The RequestStatus is never modified
+    by the plan; the plan only adds a budget charge at the repair
+    admission (see Scheduler._recovery_plan_budget).
+    """
+
+    request_id: str
+    # [rollback_boundary, corrupt_end): the physical repair span, in token
+    # positions. This is what num_scheduled_tokens carries for the repair
+    # step -- the worker's execution geometry stays physical.
+    repair_span: tuple[int, int]
+    # The budget-equivalent compute charge, in prefill-equivalent tokens
+    # (E = ceil(T_repair / m(ctx))). NOT a physical token count: the
+    # repair's replay is deeper per position than an ordinary prefill, and
+    # the charge makes the step budgets pay for that difference.
+    est_equivalent_tokens: int
+    # Exclusive layer limit: the repair executes layers [0, layer_end) only
+    # (the necessary range: below-CL hidden-state replay + the CL KV write).
+    layer_end: int = 0
+    # The pre-failure external computed count C: num_computed_tokens is
+    # restored to this at the repair commit -- ONLY while the report
+    # certified the above-span external ranges landed byte-exact
+    # (healthy_above_span); otherwise the commit restores to the repair
+    # span's end and the resume recomputes the untrusted above-span
+    # extent.
+    restored_extent: int = 0
+    # The report's certification that the above-span external ranges
+    # landed byte-exact. When False the commit's extent restoration is
+    # CAPPED at the repair span's end (the largest commit-checked
+    # boundary): the untrusted [span_end, C) content is never consumed
+    # as cached; the ordinary resume recompute rewrites it.
+    healthy_above_span: bool = True
+    # The report's failed block ids (the abort path's eviction targets).
+    failed_block_ids: list[int] = field(default_factory=list)
+    # The plan identity: echoed by the repair result; a mismatched echo is
+    # a stale/duplicate result and is rejected.
+    plan_id: int = -1
+    # The execution epoch: the scheduler step at which the plan was
+    # admitted. A result echoing a different epoch is stale (the
+    # overlapping-step rejection).
+    admitted_step: int | None = None
+    state: str = "DETECTED"
+    num_deferrals: int = 0
+
+    @property
+    def n_eff(self) -> int:
+        return self.repair_span[1] - self.repair_span[0]
 
 
 class Scheduler(SchedulerInterface):
@@ -153,6 +212,15 @@ class Scheduler(SchedulerInterface):
         self.connector = None
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
+        self.repair_kv_load_failures = False
+        # Delayed publication: request ids whose sync external-claim blocks
+        # were left unpublished at admission under the repair policy;
+        # published at the step's update once the delivery verdict is known.
+        self._delayed_sync_claim_pubs: set[str] = set()
+        # Transactional publication: request ids whose repair-step
+        # admissions were left unpublished at allocate_slots; they publish
+        # ONLY on the step's accepted verdict, never on abort/missing/stale.
+        self._delayed_repair_txn_pubs: set[str] = set()
         self.defer_block_free = False
         # Whether a preempted request's in-flight output must be dropped; see
         # KVConnectorBase_V1.requires_kv_delivery.
@@ -171,6 +239,7 @@ class Scheduler(SchedulerInterface):
                 self.connector_prefix_cache_stats = PrefixCacheStats()
             kv_load_failure_policy = kv_transfer_config.kv_load_failure_policy
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            self.repair_kv_load_failures = kv_load_failure_policy == "repair"
 
             # With overlapping batches (async scheduling or PP), a step may
             # still be writing a freed request's KV blocks. A consumer KV
@@ -235,6 +304,11 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+
+        # Hole recovery: pending repair plans, keyed by request id. A plan
+        # adds an equivalent-token budget charge at the repair admission.
+        self.recovery_plans: dict[str, RecoveryPlan] = {}
+        self._next_repair_plan_id = 0
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -559,6 +633,58 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _recovery_plan_budget(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        input_budget: int,
+        draft_slots: int,
+    ) -> tuple[int, int] | None:
+        """Hole-repair budget admission for a pending recovery plan.
+
+        The plan's physical repair span (n_eff) is scheduled as ordinary
+        tokens; its equivalent-token compute charge is debited from the
+        step's input budget as an additional surcharge beside
+        num_new_tokens -- the draft_slots precedent (a per-request debit
+        that is NOT part of num_scheduled_tokens, so the worker's
+        execution geometry stays physical).
+
+        Returns (num_new_tokens, surcharge), or None when the request must
+        be deferred this step (the plan stays pending). A plan no step
+        could ever fund is rejected: it dissolves and the ordinary
+        rollback-recompute reschedule owns the request (the configured
+        failure-policy floor).
+        """
+        plan = self.recovery_plans.get(request.request_id)
+        if plan is None:
+            return num_new_tokens, 0
+        if plan.state != "DETECTED":
+            # ADMITTED: the repair step is scheduled and its verdict is
+            # pending. Defer the request until the verdict is consumed:
+            # with the batch queue (async scheduling) the next schedule()
+            # runs before the verdict, and rows scheduled beside the
+            # pending plan would race the commit's num_computed_tokens
+            # restoration (double execution, mis-sequenced samples).
+            # The verdict always arrives -- the repair step's output is
+            # queued ahead of any later step, and a missing result is
+            # synthesized as a failed verdict at that step's update.
+            return None
+        if (
+            plan.est_equivalent_tokens
+            > self.scheduler_config.max_num_batched_tokens
+            or plan.n_eff > self.max_num_scheduled_tokens
+        ):
+            self.recovery_plans.pop(request.request_id)
+            return num_new_tokens, 0
+        # The repair step schedules exactly the repair span.
+        num_new_tokens = min(num_new_tokens, plan.n_eff)
+        surcharge = max(0, plan.est_equivalent_tokens - plan.n_eff)
+        num_new_tokens = min(num_new_tokens, input_budget - draft_slots - surcharge)
+        if num_new_tokens < plan.n_eff:
+            plan.num_deferrals += 1
+            return None
+        return num_new_tokens, surcharge
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -579,6 +705,14 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        repair_charges: dict[str, int] = {}
+        repair_admitted = False
+        # Hole repair: pending plans are the first and only admission of
+        # their step (the layer-limited repair execution cannot share a
+        # forward with ordinary work).
+        repair_pending = any(
+            plan.state == "DETECTED" for plan in self.recovery_plans.values()
+        )
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
@@ -631,6 +765,23 @@ class Scheduler(SchedulerInterface):
             request = self.running[req_index]
             if input_budget <= draft_slots:
                 break
+            if repair_admitted:
+                # A repair step is exclusive: the layer-limited repair
+                # execution cannot share a forward with ordinary work.
+                num_new_tokens = 0
+                req_index += 1
+                continue
+            if (
+                repair_pending
+                and request.request_id not in self.recovery_plans
+            ):
+                # The pending plan drains first; ordinary running work
+                # waits one step. The damaged request itself must fall
+                # through to the budget call below: freezing it here
+                # would skip its own admission (deadlock).
+                num_new_tokens = 0
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -678,8 +829,21 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            # Reserve the pending plan's equivalent-token charge before the
+            # cap, or the later surcharge debit would not fit the budget.
+            _pending_plan = self.recovery_plans.get(request.request_id)
+            _repair_reserve = (
+                _pending_plan.est_equivalent_tokens
+                if (
+                    _pending_plan is not None
+                    and _pending_plan.state == "DETECTED"
+                )
+                else 0
+            )
             num_new_tokens = min(
-                num_new_tokens, token_budget, input_budget - draft_slots
+                num_new_tokens,
+                token_budget,
+                input_budget - draft_slots - _repair_reserve,
             )
 
             # Make sure the input position does not exceed the max model len.
@@ -721,6 +885,20 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
+            # Charge the plan's equivalent-token surcharge, or defer the
+            # request this step (falling into the skip below).
+            recovery_surcharge = 0
+            recovery = self._recovery_plan_budget(
+                request, num_new_tokens, input_budget, draft_slots
+            )
+            if recovery is None:
+                num_new_tokens = 0
+            else:
+                num_new_tokens, recovery_surcharge = recovery
+            if repair_pending and not self.recovery_plans:
+                # The plan was dissolved at the gate: the constraint lifts.
+                repair_pending = False
+
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -743,15 +921,29 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                # A repair transaction's admission must not publish its
+                # blocks before the verdict: nothing whose validity depends
+                # on an unresolved transaction may be matchable.
+                repair_plan = self.recovery_plans.get(request.request_id)
+                delay_repair_txn = (
+                    self.repair_kv_load_failures
+                    and repair_plan is not None
+                    and repair_plan.state in ("DETECTED", "ADMITTED")
+                )
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        delay_cache_blocks=delay_repair_txn,
                     )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        if delay_repair_txn:
+                            self._delayed_repair_txn_pubs.add(
+                                request.request_id
+                            )
                         break
 
                     if (
@@ -784,8 +976,9 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            restored_charge = repair_charges.pop(preempted_req_id, 0)
                             token_budget += restored
-                            input_budget += restored + draft_slots
+                            input_budget += restored + draft_slots + restored_charge
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -823,7 +1016,14 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            input_budget -= num_new_tokens + draft_slots
+            input_budget -= num_new_tokens + draft_slots + recovery_surcharge
+            if recovery_surcharge:
+                repair_charges[request_id] = recovery_surcharge
+            recovery_plan = self.recovery_plans.get(request_id)
+            if recovery_plan is not None and recovery_plan.state == "DETECTED":
+                recovery_plan.state = "ADMITTED"
+                recovery_plan.admitted_step = self.current_step
+                repair_admitted = True
             req_index += 1
 
             # Speculative decode related.
@@ -895,6 +1095,18 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if repair_admitted:
+                    # One repair per step.
+                    skip_request(request_queue)
+                    continue
+                if (
+                    repair_pending
+                    and request.request_id not in self.recovery_plans
+                ):
+                    # The pending plan drains first.
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1167,6 +1379,20 @@ class Scheduler(SchedulerInterface):
                         request, num_computed_tokens, num_new_tokens
                     )
 
+                    # Hole repair: charge the plan's equivalent-token
+                    # surcharge, or defer the request this step.
+                    recovery = self._recovery_plan_budget(
+                        request, num_new_tokens, input_budget, draft_slots
+                    )
+                    if recovery is None:
+                        skip_request(request_queue)
+                        continue
+                    num_new_tokens, recovery_surcharge = recovery
+                    if repair_pending and not self.recovery_plans:
+                        # The plan was dissolved at the gate: the
+                        # constraint lifts.
+                        repair_pending = False
+
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
                         break
@@ -1206,6 +1432,18 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
+                # Delayed publication: under the repair policy a sync
+                # external claim is not content-verified until the step's
+                # delivery verdict, while the admission-time publication is
+                # content-blind (a hash of token ids). Publishing here would
+                # let a same-pass request match and consume unverified KV.
+                # Delay like the P/D async precedent; publish at the step's
+                # update.
+                delay_sync_claim_pub = (
+                    self.repair_kv_load_failures
+                    and num_external_computed_tokens > 0
+                    and not load_kv_async
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_tokens_past_hit,
@@ -1213,7 +1451,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=load_kv_async or delay_sync_claim_pub,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
@@ -1293,6 +1531,8 @@ class Scheduler(SchedulerInterface):
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
+                    if delay_sync_claim_pub:
+                        self._delayed_sync_claim_pubs.add(request.request_id)
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -1311,7 +1551,14 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
-                input_budget -= num_new_tokens + draft_slots
+                input_budget -= num_new_tokens + draft_slots + recovery_surcharge
+                if recovery_surcharge:
+                    repair_charges[request_id] = recovery_surcharge
+                recovery_plan = self.recovery_plans.get(request_id)
+                if recovery_plan is not None and recovery_plan.state == "DETECTED":
+                    recovery_plan.state = "ADMITTED"
+                    recovery_plan.admitted_step = self.current_step
+                    repair_admitted = True
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1482,6 +1729,38 @@ class Scheduler(SchedulerInterface):
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
 
+        if repair_admitted:
+            # The worker-side descriptors for this step's repair-only
+            # executions: an exclusive repair step carries every scheduled
+            # request.
+            scheduler_output.repair_works = {
+                req_id: RepairWork(
+                    request_id=req_id,
+                    repair_span=plan.repair_span,
+                    layer_end=plan.layer_end,
+                    restored_extent=plan.restored_extent,
+                    plan_id=plan.plan_id,
+                    epoch=plan.admitted_step if plan.admitted_step is not None else -1,
+                    # The ownership authorization: the
+                    # scheduler-authoritative physical blocks covering the
+                    # repair's write set, snapshotted from KVCacheManager
+                    # at this admission (after the step's allocation) --
+                    # the worker validates its geometry against THESE,
+                    # never against its own metadata.
+                    # _repair_write_set_block_ids asserts the single
+                    # KV cache group scope.
+                    expected_write_block_ids=tuple(
+                        self._repair_write_set_block_ids(
+                            self.requests[req_id],
+                            plan.repair_span[0],
+                            plan.repair_span[1],
+                        )
+                    ),
+                )
+                for req_id, plan in self.recovery_plans.items()
+                if plan.state == "ADMITTED" and req_id in num_scheduled_tokens
+            }
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -1573,6 +1852,9 @@ class Scheduler(SchedulerInterface):
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
         request.num_preemptions += 1
+        # The whole prompt is recomputed on re-admission: any pending
+        # hole-repair plan is void.
+        self.recovery_plans.pop(request.request_id, None)
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
@@ -1996,6 +2278,56 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
+        repair_dispositions: dict[str, str] = {}
+        if kv_connector_output and kv_connector_output.load_failure_reports:
+            failed_kv_load_req_ids.update(
+                self._handle_repair_reports(kv_connector_output.load_failure_reports)
+            )
+        if kv_connector_output and kv_connector_output.repair_results:
+            # The repair step's verdicts, one per admitted work item. TP
+            # aggregation may repeat a request's verdict across ranks; the
+            # duplicate is rejected as stale by the identity machinery and
+            # the dispositions keep the first verdict.
+            for result in kv_connector_output.repair_results:
+                if result.request_id in repair_dispositions:
+                    self._consume_repair_result(result)
+                else:
+                    repair_dispositions[result.request_id] = (
+                        self._consume_repair_result(result)
+                    )
+        if scheduler_output.repair_works:
+            # Every work admitted this step must produce its verdict at
+            # THIS update: a missing result would leave the plan ADMITTED
+            # indefinitely (the request stuck above the rollback floor,
+            # the span's blocks held). Fail safe: synthesize the missing
+            # verdict as a failed result -- the abort fallback, never a
+            # silent retry loop.
+            for req_id, work in scheduler_output.repair_works.items():
+                if req_id in repair_dispositions:
+                    continue
+                plan = self.recovery_plans.get(req_id)
+                if plan is None or plan.state != "ADMITTED":
+                    continue
+                logger.warning(
+                    "Repair step admitted req=%s plan_id=%d span=%s but no "
+                    "verdict arrived with it; applying the recompute "
+                    "fallback",
+                    req_id,
+                    work.plan_id,
+                    work.repair_span,
+                )
+                missing = RepairResultReport(
+                    request_id=req_id,
+                    plan_id=work.plan_id,
+                    epoch=work.epoch,
+                    structural_check=False,
+                    executed_layers=0,
+                    span=work.repair_span,
+                    aborted=True,
+                )
+                repair_dispositions[req_id] = self._consume_repair_result(
+                    missing
+                )
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
                 self._handle_failed_recving(kv_connector_output.failed_recving)
@@ -2009,6 +2341,28 @@ class Scheduler(SchedulerInterface):
                     kv_connector_output.invalid_block_ids,
                     num_scheduled_tokens,
                 )
+            )
+        # Delayed publication: the delivery verdict for this step's
+        # external claims is now known (the failure channels above
+        # consumed their reports); publish the verified ones.
+        self._publish_delayed_sync_claims(failed_kv_load_req_ids)
+        # Transactional publication: every repair-step admission recorded
+        # in _delayed_repair_txn_pubs has its verdict in this update (the
+        # missing-result fail-safe guarantees a disposition for every
+        # admitted work). Publish ONLY on the accepted verdict -- the
+        # committed extent is fully written and verified at this point.
+        # Every other disposition stays unpublished: the abort path evicts
+        # the span, and the fallback recompute republishes through the
+        # ordinary path.
+        for req_id in list(self._delayed_repair_txn_pubs):
+            self._delayed_repair_txn_pubs.discard(req_id)
+            if repair_dispositions.get(req_id) != "committed":
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_computed_tokens
             )
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -2028,6 +2382,13 @@ class Scheduler(SchedulerInterface):
                     assert request.num_stale_output_tokens >= 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
+                continue
+            if request is not None and req_id in self.recovery_plans:
+                # The request has a pending recovery plan: any output this
+                # step produced for it was computed over untrusted state.
+                # With async scheduling the batch queue can deliver a
+                # schedule-ahead step's output after the failure is known;
+                # suppress it until the repair verdict restores the request.
                 continue
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
@@ -2244,7 +2605,11 @@ class Scheduler(SchedulerInterface):
         self.grammar_compile_error_reqs.clear()
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
-        if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
+        if (
+            failed_kv_load_req_ids
+            and not self.recompute_kv_load_failures
+            and not self.repair_kv_load_failures
+        ):
             error_req_ids.update(failed_kv_load_req_ids)
         if self.ec_connector is not None:
             # An encoder input the connector can no longer obtain. Failing is
@@ -2668,6 +3033,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self.recovery_plans.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -3049,6 +3415,37 @@ class Scheduler(SchedulerInterface):
         request.replay_start = num_hit_tokens - num_replay_tokens
         return num_replay_tokens
 
+    def _publish_delayed_sync_claims(self, failed_req_ids: set[str]) -> None:
+        """Publish the sync external-claim blocks whose delivery this
+        step verified.
+
+        Requests named by any failure channel (the structured report arm,
+        the flat invalid-blocks walk, async recv failures) keep their
+        blocks unpublished: their truncation/eviction arms own them, and
+        unmatchable is the safe state for unverified content. Aborted or
+        finished requests keep theirs unpublished too: their blocks are
+        freed, and a hash entry would map to freed blocks.
+        """
+        if not self._delayed_sync_claim_pubs:
+            return
+        pending, self._delayed_sync_claim_pubs = (
+            self._delayed_sync_claim_pubs,
+            set(),
+        )
+        for req_id in pending:
+            if req_id in failed_req_ids:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            # num_computed_tokens already covers the verified claim plus
+            # the chunk the completed forward wrote (the schedule-time
+            # advance), so this mirrors the async recv precedent's
+            # success arm.
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_computed_tokens
+            )
+
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """KV Connector: update request state after async recv is finished.
 
@@ -3261,6 +3658,324 @@ class Scheduler(SchedulerInterface):
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
+    # Per-layer fixed cost of a repair layer.forward in equivalent
+    # prefill tokens: at small spans the launch-bound floor dominates, so
+    # each replayed layer charges this floor beside the layer-fraction
+    # term (a conservative placeholder).
+    REPAIR_LAYER_EQ_TOKENS = 32
+
+    def _repair_estimate(self, n_eff: int, layer_end: int) -> int:
+        n_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        return math.ceil(
+            n_eff * layer_end / n_layers + layer_end * self.REPAIR_LAYER_EQ_TOKENS
+        )
+
+    def _handle_repair_reports(
+        self, reports: list[KVLoadFailureReport]
+    ) -> set[str]:
+        """Consume structured load-failure reports under the repair policy:
+        truncate each affected request to its rollback boundary, install
+        the RecoveryPlan, and return the ids whose (garbage) outputs from
+        the detection step must be skipped."""
+        if not self.repair_kv_load_failures:
+            policy = self.vllm_config.kv_transfer_config.kv_load_failure_policy
+            raise RuntimeError(
+                "A KV connector reported load_failure_reports while "
+                f"kv_load_failure_policy={policy!r}; the repair policy "
+                "is required to consume reports."
+            )
+        skip_req_ids: set[str] = set()
+        for report in reports:
+            if not self._assert_repair_preconditions(report):
+                continue
+            request = self.requests[report.request_id]
+            rollback, corrupt_end = (
+                report.rollback_boundary,
+                report.token_span[1],
+            )
+            write_set = self._repair_write_set_block_ids(
+                request, rollback, corrupt_end
+            )
+            violating_block = self._write_set_shared_block(write_set)
+            if violating_block is not None:
+                # Write-set fence: the repair execution writes the span's
+                # blocks at every executed layer, so any shared or
+                # published block in the write set cannot be repaired
+                # without breaking sharer/reader safety. Fail closed: no
+                # plan, the ordinary recompute floor owns the request, and
+                # the write set and everything downstream are evicted so
+                # no future request matches it.
+                self._reject_shared_block_repair(request, report, write_set)
+                skip_req_ids.add(report.request_id)
+                continue
+            request.num_computed_tokens = rollback
+            # The async schedule-ahead may have left placeholder accounting
+            # for in-flight steps whose outputs are now suppressed.
+            request.num_output_placeholders = 0
+            layer_end = max(report.observed_failed_layers) + 1
+            self._next_repair_plan_id += 1
+            plan = RecoveryPlan(
+                request_id=report.request_id,
+                repair_span=(rollback, corrupt_end),
+                est_equivalent_tokens=self._repair_estimate(
+                    corrupt_end - rollback, layer_end
+                ),
+                layer_end=layer_end,
+                restored_extent=report.restored_extent,
+                healthy_above_span=report.healthy_above_span,
+                failed_block_ids=list(report.failed_block_ids),
+                plan_id=self._next_repair_plan_id,
+            )
+            self.recovery_plans[report.request_id] = plan
+            skip_req_ids.add(report.request_id)
+            logger.info(
+                "Repair plan admitted: req=%s plan_id=%d span=[%d,%d) "
+                "layer_end=%d E=%d restored_extent=%d "
+                "healthy_above_span=%s",
+                report.request_id,
+                plan.plan_id,
+                rollback,
+                corrupt_end,
+                layer_end,
+                plan.est_equivalent_tokens,
+                report.restored_extent,
+                report.healthy_above_span,
+            )
+        return skip_req_ids
+
+    def _repair_write_set_block_ids(
+        self, request: Request, rollback: int, corrupt_end: int
+    ) -> list[int]:
+        """The COMPLETE physical write set of the repair execution: every
+        block covering [rollback, corrupt_end). The repair stream advances
+        through the layers below the extent writing each layer's KV
+        natively, so the span's blocks are written at EVERY executed layer
+        -- the block set is layer-invariant in v1's single kv-cache-group
+        geometry, but the fence must cover the whole span: the stream's
+        writes go beyond the failed blocks whenever the rollback boundary
+        sits below the failed region."""
+        (req_block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
+        first = rollback // self.block_size
+        last = -(-corrupt_end // self.block_size)
+        return req_block_ids[first:last]
+
+    def _write_set_shared_block(self, write_set: list[int]) -> int | None:
+        """The first write-set block that is shared (ref_cnt > 1: another
+        request's table references it) or published (block_hash set: any
+        future request with the same prefix would match it), or None when
+        the whole write set is private and unpublished."""
+        block_pool = self.kv_cache_manager.block_pool
+        for block_id in write_set:
+            block = block_pool.blocks[block_id]
+            if block.ref_cnt > 1 or block.block_hash is not None:
+                return block_id
+        return None
+
+    def _reject_shared_block_repair(
+        self,
+        request: Request,
+        report: KVLoadFailureReport,
+        write_set: list[int],
+    ) -> None:
+        # Fail closed for the shared-block shape: the write set and
+        # everything downstream are evicted so no future request matches
+        # the untrusted content, and the request truncates to its rollback
+        # boundary for the ordinary recompute fallback.
+        logger.warning(
+            "KV repair refused: the write set spans a shared or published "
+            "block; failing closed to the recompute fallback (req=%s, "
+            "rollback=%d)",
+            request.request_id,
+            report.rollback_boundary,
+        )
+        (req_block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
+        start_idx = req_block_ids.index(write_set[0])
+        blocks_to_evict = set(req_block_ids[start_idx:])
+        self.kv_cache_manager.evict_blocks(blocks_to_evict)
+        request.num_computed_tokens = report.rollback_boundary
+
+    def _assert_repair_preconditions(self, report: KVLoadFailureReport) -> bool:
+        request = self.requests.get(report.request_id)
+        if request is None or request.is_finished():
+            return False
+        if report.request_id in self.recovery_plans:
+            # Single-region law: an existing plan absorbs an identical
+            # report and refuses a divergent one loudly.
+            existing = self.recovery_plans[report.request_id]
+            if existing.repair_span != (
+                report.rollback_boundary,
+                report.token_span[1],
+            ):
+                raise RuntimeError(
+                    f"A second load-failure report for {report.request_id} "
+                    "names a different region; multi-region repair is not "
+                    "supported (the failure-policy fallback applies)."
+                )
+            return False
+        if len(report.failed_block_ids) != 1:
+            raise RuntimeError(
+                f"load-failure report for {report.request_id} names "
+                f"{len(report.failed_block_ids)} blocks; v1 repair supports "
+                "exactly one failed region."
+            )
+        if not (
+            report.rollback_boundary <= report.token_span[0]
+            and report.token_span[1] <= report.restored_extent
+            and report.token_span[0] < report.token_span[1]
+        ):
+            raise RuntimeError(
+                f"Malformed load-failure report for {report.request_id}: "
+                f"span={report.token_span} rollback={report.rollback_boundary} "
+                f"restored_extent={report.restored_extent}"
+            )
+        # A report whose geometry does not check out is a connector
+        # contract violation: refuse loudly so the malformed shape never
+        # reaches the repair machinery.
+        (req_block_ids,) = self.kv_cache_manager.get_block_ids(report.request_id)
+        for block_id in report.failed_block_ids:
+            if block_id not in req_block_ids:
+                raise RuntimeError(
+                    f"load-failure report for {report.request_id} names "
+                    f"block {block_id} which is not in the reporting "
+                    "request's block table (block ownership violation)."
+                )
+        bs = self.block_size
+        if (
+            report.rollback_boundary % bs
+            or report.token_span[0] % bs
+            or report.token_span[1] % bs
+        ):
+            raise RuntimeError(
+                f"load-failure report for {report.request_id} is not "
+                f"block-aligned (block_size={bs}): "
+                f"span={report.token_span} "
+                f"rollback={report.rollback_boundary}"
+            )
+        n_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+        if not report.observed_failed_layers or any(
+            not (0 <= layer < n_layers)
+            for layer in report.observed_failed_layers
+        ):
+            raise RuntimeError(
+                f"load-failure report for {report.request_id} carries "
+                f"invalid failed-layer information "
+                f"{report.observed_failed_layers!r} (model has "
+                f"{n_layers} layers)."
+            )
+        span_first = report.token_span[0] // bs
+        span_last = -(-report.token_span[1] // bs)
+        if list(req_block_ids[span_first:span_last]) != list(
+            report.failed_block_ids
+        ):
+            raise RuntimeError(
+                f"load-failure report for {report.request_id}: the span "
+                f"{report.token_span} maps to blocks "
+                f"{req_block_ids[span_first:span_last]} but the report "
+                f"claims {report.failed_block_ids} (token-span/block-ID "
+                "correspondence violation)."
+            )
+        return True
+
+    def _consume_repair_result(
+        self, result: RepairResultReport
+    ) -> Literal["committed", "aborted", "stale"]:
+        """Consume the repair step's commit verdict: restore the logical
+        cached extent on pass, fall back to the ordinary
+        rollback-recompute on failure. A result that does not echo the
+        pending plan's identity (plan_id, epoch, span) is a stale or
+        duplicate report and is rejected without touching the plan.
+
+        Returns the disposition: "committed" (the extent restored),
+        "aborted" (the rollback-recompute fallback applied), or "stale"
+        (rejected; the plan untouched).
+        """
+        plan = self.recovery_plans.get(result.request_id)
+        if plan is None or plan.state != "ADMITTED":
+            return "stale"
+        if (
+            result.plan_id != plan.plan_id
+            or result.epoch != plan.admitted_step
+            or result.span != plan.repair_span
+        ):
+            return "stale"
+        plan.state = "REPAIRING"
+        request = self.requests.get(result.request_id)
+        self.recovery_plans.pop(result.request_id, None)
+        if request is None:
+            # The request object is already gone (it finished before the
+            # verdict arrived) -- nothing to restore or truncate.
+            return "committed" if result.structural_check else "aborted"
+        if result.structural_check:
+            # The conditional restoration: the pre-failure extent C is
+            # restored ONLY when the report certified the above-span
+            # external ranges landed byte-exact. Without the
+            # certification the restoration is capped at the repair
+            # span's end -- the largest boundary the commit check covers
+            # -- and the resume recomputes the untrusted [span_end, C)
+            # extent through the ordinary path.
+            restored = (
+                plan.restored_extent
+                if plan.healthy_above_span
+                else plan.repair_span[1]
+            )
+            # The result is untrusted input: an aborted verdict reaching
+            # the commit arm or a negative layer count must never
+            # advance the frontier -- reject loudly with the fail-safe
+            # recompute fallback.
+            malformed = result.aborted or result.executed_layers < 0
+            if malformed:
+                logger.warning(
+                    "Malformed repair result for req=%s plan_id=%d: "
+                    "aborted=%s executed_layers=%d -> recompute fallback",
+                    result.request_id,
+                    plan.plan_id,
+                    result.aborted,
+                    result.executed_layers,
+                )
+                self._abort_repair_plan(plan, request, result)
+                return "aborted"
+            request.num_computed_tokens = restored
+            logger.info(
+                "Repair committed: req=%s plan_id=%d restored=%d",
+                result.request_id,
+                plan.plan_id,
+                restored,
+            )
+            return "committed"
+        self._abort_repair_plan(plan, request, result)
+        return "aborted"
+
+    def _abort_repair_plan(
+        self, plan: RecoveryPlan, request: Request, result: RepairResultReport
+    ) -> None:
+        """Abort terminal state: the partial writes were re-zeroed
+        worker-side; here the failed span is invalidated (evicted from the
+        prefix cache so no future request matches untrustworthy content),
+        the request truncates to the rollback boundary, and the ordinary
+        recompute fallback owns it. The plan is already purged."""
+        if plan.failed_block_ids:
+            (req_block_ids,) = self.kv_cache_manager.get_block_ids(
+                request.request_id
+            )
+            try:
+                failed_idx = req_block_ids.index(plan.failed_block_ids[0])
+                blocks_to_evict = set(req_block_ids[failed_idx:])
+            except ValueError:
+                blocks_to_evict = set(plan.failed_block_ids)
+            self.kv_cache_manager.evict_blocks(blocks_to_evict)
+        else:
+            blocks_to_evict = set()
+        request.num_computed_tokens = plan.repair_span[0]
+        logger.warning(
+            "Repair aborted: req=%s plan_id=%d span=%s "
+            "executed_layers=%d evicted=%d -> recompute fallback",
+            result.request_id,
+            plan.plan_id,
+            plan.repair_span,
+            result.executed_layers,
+            len(blocks_to_evict),
+        )
+
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
         """Fail closed for layouts whose block IDs are not globally unique."""
         affected_req_ids: set[str] = set()
@@ -3296,7 +4011,12 @@ class Scheduler(SchedulerInterface):
                 "KVConnectorTransferResults.failed_recving instead."
             )
 
-        should_fail = not self.recompute_kv_load_failures
+        # The repair policy keeps the flat channel's semantics at the
+        # recompute floor: a block-level failure without a structured
+        # report reschedules, never fails the request.
+        should_fail = not (
+            self.recompute_kv_load_failures or self.repair_kv_load_failures
+        )
 
         # handle async KV loads (not cached yet, evict_blocks=False)
         async_load_reqs = (

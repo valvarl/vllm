@@ -206,6 +206,63 @@ class SamplerOutput:
 
 
 @dataclass
+class KVLoadFailureReport:
+    """One failed external-KV region, reported by the connector's worker side.
+
+    Timing contract: identical to get_block_ids_with_load_errors()
+    (sync-loading failures are reported in the forward pass in which they
+    are detected). A report implies the failure is COMPLETE (no in-flight
+    reads for the region).
+    """
+
+    request_id: str
+    # The flat-set members (single KV cache group in v1).
+    failed_block_ids: list[int]
+    # [corrupt_start, corrupt_end) in token positions.
+    token_span: tuple[int, int]
+    # B_loaded: the repair's floor; <= token_span[0].
+    rollback_boundary: int
+    # The per-layer failure verdicts' union (physical layer indices).
+    observed_failed_layers: list[int]
+    # The above-span external ranges landed byte-exact.
+    healthy_above_span: bool
+    # The pre-failure external computed count C: the restoration target
+    # at the repair commit.
+    restored_extent: int
+
+
+@dataclass
+class RepairResultReport:
+    """Worker-built verdict of one repair-only execution, consumed by the
+    scheduler at update_from_output of the repair step (commit vs the
+    recompute fallback).
+
+    The production commit gate is the summary ``structural_check``;
+    ``commit_check`` is its per-element detail (diagnostics).
+    """
+
+    request_id: str
+    # The plan identity echoed from the executed RepairWork -- the stale /
+    # duplicate rejection key (with ``epoch``).
+    plan_id: int
+    # The execution epoch (the scheduler step at which the plan was
+    # admitted). A result echoing a different epoch is stale.
+    epoch: int
+    # The production commit-check verdict (the summary).
+    structural_check: bool
+    # How many layers the repair stream actually executed (== layer_end on
+    # a clean run; < layer_end only on an aborted run).
+    executed_layers: int
+    # The physical repair span, for the scheduler's cross-check.
+    span: tuple[int, int]
+    # True when the repair was aborted by a forced/operational failure
+    # after partial writes (as opposed to a commit-check failure).
+    aborted: bool = False
+    # The per-element commit-check detail (diagnostics).
+    commit_check: dict[str, bool] | None = None
+
+
+@dataclass
 class KVConnectorOutput:
     # [req_ids]
     finished_sending: set[str] | None = None
@@ -219,6 +276,13 @@ class KVConnectorOutput:
     # Receive failures keyed by request identity. This remains unambiguous for
     # hybrid/multi-pool cache layouts where numeric block IDs overlap.
     failed_recving: set[str] = field(default_factory=set)
+    # Structured load-failure regions reported by connectors that support
+    # the hole-repair policy (``kv_load_failure_policy="repair"``). Absent
+    # or empty for every other connector: behavior is byte-identical.
+    load_failure_reports: list[KVLoadFailureReport] | None = None
+    # The repair-only step's commit verdicts (one per repair work item).
+    # None on every ordinary step.
+    repair_results: list[RepairResultReport] | None = None
     # Configuration describing how many finished sending/receiving
     # notifications should be expected for each request. This allows
     # handshake-based connectors like Nixl to update the KVOutputAggregator.
@@ -234,6 +298,8 @@ class KVConnectorOutput:
             and not self.kv_cache_events
             and not self.invalid_block_ids
             and not self.failed_recving
+            and not self.load_failure_reports
+            and not self.repair_results
             and not self.kv_connector_worker_meta
         )
 
