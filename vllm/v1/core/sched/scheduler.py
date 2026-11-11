@@ -699,25 +699,47 @@ class Scheduler(SchedulerInterface):
             or plan.n_eff > self.max_num_scheduled_tokens
         ):
             self._dissolve_recovery_plan(plan, "cannot fit any step budget")
-            return num_new_tokens, 0
+            # Skip this step for the owner rather than scheduling an
+            # ordinarily-capped chunk: the long-prefill threshold was
+            # EXEMPTED for this request while the plan existed, so
+            # returning the uncapped catch-up here would let one
+            # dissolution step bypass the threshold (the review's N5).
+            # The next step schedules ordinarily, threshold applied.
+            return 0, 0
         # The repair step schedules exactly the repair span.
         num_new_tokens = min(num_new_tokens, plan.n_eff)
         surcharge = max(0, plan.est_equivalent_tokens - plan.n_eff)
         num_new_tokens = min(num_new_tokens, input_budget - draft_slots - surcharge)
         if num_new_tokens < plan.n_eff:
-            # Bounded deferral. A DETECTED plan freezes every other
-            # request of its steps (the drain-first exclusivity), so an
-            # unbounded deferral is an engine-wide stall, not just a
-            # per-request one. After REPAIR_MAX_ADMISSION_DEFERRALS
-            # consecutive steps without admission, the plan dissolves
-            # and the ordinary rollback-recompute path -- which chunks
-            # and always makes progress -- owns the request.
+            # Defer the request this step (the plan stays pending). The
+            # deferral COUNT is ticked once per schedule() step for
+            # every DETECTED plan that was not admitted (see
+            # _tick_recovery_plan_deferrals), NOT here: owners skipped
+            # before this call -- blocked remote-KV waits, paused
+            # sessions, DP-balancing and PP-cadence skips -- must be
+            # bounded identically, and they never reach this branch.
+            return None
+        return num_new_tokens, surcharge
+
+    def _tick_recovery_plan_deferrals(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> None:
+        """The step-level deferral tick: every DETECTED plan that was not
+        admitted THIS step -- whatever the reason: a budget deferral, an
+        owner skipped before its budget call, a blocked remote-KV wait,
+        a paused streaming session -- moves one step closer to the
+        bound. This is the uniform liveness guard: no plan, and
+        therefore no engine-wide drain-first freeze, can outlive
+        REPAIR_MAX_ADMISSION_DEFERRALS steps without either admitting
+        or dissolving to the recompute fallback (which chunks, and
+        therefore always makes progress)."""
+        for req_id in list(self.recovery_plans):
+            plan = self.recovery_plans[req_id]
+            if plan.state != "DETECTED" or req_id in num_scheduled_tokens:
+                continue
             plan.num_deferrals += 1
             if plan.num_deferrals >= self.REPAIR_MAX_ADMISSION_DEFERRALS:
                 self._dissolve_recovery_plan(plan, "admission deferral bound")
-                return 0, 0
-            return None
-        return num_new_tokens, surcharge
 
     def _dissolve_recovery_plan(self, plan: RecoveryPlan, reason: str) -> None:
         """Drop a DETECTED plan and hand the request to the ordinary
@@ -1450,6 +1472,7 @@ class Scheduler(SchedulerInterface):
 
                     # Hole repair: charge the plan's equivalent-token
                     # surcharge, or defer the request this step.
+                    _had_plan = request.request_id in self.recovery_plans
                     recovery = self._recovery_plan_budget(
                         request, num_new_tokens, input_budget, draft_slots
                     )
@@ -1463,6 +1486,18 @@ class Scheduler(SchedulerInterface):
                         repair_pending = False
 
                     if num_new_tokens == 0:
+                        if _had_plan and request.request_id not in (
+                            self.recovery_plans
+                        ):
+                            # A just-dissolved plan: the drain-first
+                            # constraint lifted mid-step, so the freeze
+                            # must not outlive the plan in this arm
+                            # either -- skip the owner (it re-enters next
+                            # step through the ordinary path) and keep
+                            # examining the queue behind it (the
+                            # review's N6 asymmetry).
+                            skip_request(request_queue)
+                            continue
                         # The request cannot be scheduled.
                         break
 
@@ -1773,6 +1808,11 @@ class Scheduler(SchedulerInterface):
             scheduled_encoder_input_stats = self._make_scheduled_encoder_input_stats(
                 scheduled_encoder_inputs
             )
+
+        # Bounded admission (the review's N2): tick the deferral count of
+        # every DETECTED plan this step did not admit, so owners skipped
+        # before their budget call are bounded exactly like deferred ones.
+        self._tick_recovery_plan_deferrals(num_scheduled_tokens)
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -4059,7 +4099,11 @@ class Scheduler(SchedulerInterface):
         # certifies [0, its rollback) healthy on its rank, so the minimum
         # rollback is healthy on ALL reporting ranks. A rollback already
         # certified by an installed plan (the divergent-against-plan
-        # shape) joins the minimum as trusted evidence.
+        # shape) joins the minimum as trusted evidence -- but only when
+        # at least one of the new reports is itself well-formed: with
+        # exclusively malformed evidence even the plan's boundary is
+        # untrustworthy, and the full-recompute floor (rollback 0)
+        # applies.
         certified = [r.rollback_boundary for r in well_formed]
         if trusted_rollback is not None and well_formed:
             certified.append(trusted_rollback)

@@ -31,6 +31,8 @@ from tests.v1.core.test_scheduler_repair_budget import (
     BS,
     E,
     N_EFF,
+    _deliver_report,
+    _structured_report,
     admit_async_external_hit,
     admit_sync_external_hit,
     fail_and_truncate,
@@ -94,13 +96,13 @@ def test_static_never_admissible_plan_dissolves_immediately():
     )
     r1.num_computed_tokens = plan.repair_span[0]
     out2 = scheduler.schedule()
-    # Dissolved: no repair work, the ordinary reschedule owns the
-    # request from the rollback boundary (the dissolution step's chunk
-    # is still reserve-capped -- benign, one smaller chunk -- and the
-    # next step is unconstrained).
+    # Dissolved: no repair work, and the owner skips THIS step (the
+    # dissolution returns a zero schedule so the threshold exemption
+    # the plan carried cannot leak an uncapped chunk -- the review's
+    # N5); the next step schedules ordinarily, threshold applied.
     assert scheduler.recovery_plans == {}
     assert out2.repair_works is None
-    assert out2.num_scheduled_tokens[r1.request_id] > 0
+    assert r1.request_id not in out2.num_scheduled_tokens
     out3 = scheduler.schedule()
     assert out3.num_scheduled_tokens[r1.request_id] > 0
 
@@ -161,56 +163,68 @@ def test_budget_exactly_at_threshold_admits():
     assert out.num_scheduled_tokens[r1.request_id] == N_EFF
 
 
-def test_deferral_bound_dissolves_to_recompute_fallback():
-    """A plan that repeatedly fails admission (here: the dynamic caps
-    keep num_new_tokens below the span) dissolves after
-    REPAIR_MAX_ADMISSION_DEFERRALS consecutive deferrals and the
-    ordinary chunked recompute owns the request."""
+def test_deferral_bound_dissolves_blocked_owner(monkeypatch):
+    """The step-level bound, end to end through schedule(): the review's
+    no-tick shape -- a contract-violating connector reports a failed
+    async load but never delivers finished_recving, so the owner stays
+    parked in WAITING_FOR_REMOTE_KV and never reaches its budget call.
+    The pre-hardening code never ticked such a plan (the engine-wide
+    freeze persisted until the request was aborted externally); the
+    step-level tick bounds it: after REPAIR_MAX_ADMISSION_DEFERRALS
+    steps the plan dissolves and ordinary traffic (r2) resumes."""
+    monkeypatch.setattr(Scheduler, "REPAIR_MAX_ADMISSION_DEFERRALS", 3)
     scheduler = make_scheduler(
         kv_load_failure_policy="repair", max_num_batched_tokens=8192
     )
     r1 = create_request(num_tokens=3328)
+    r2 = create_request(num_tokens=512)
     scheduler.add_request(r1)
-    admit_sync_external_hit(scheduler, r1, 3072)
+    scheduler.add_request(r2)
+    admit_async_external_hit(scheduler, r1, 3072)
     out1 = scheduler.schedule()
-    assert r1.request_id in out1.num_scheduled_tokens
+    assert r2.request_id in out1.num_scheduled_tokens
+    # Give r2 a sampled token so its decode work is observable later.
+    output1 = create_model_runner_output(reqs=[r1, r2], use_eos=False)
+    scheduler.update_from_output(out1, output1)
 
-    plan = _plan_installed(scheduler, r1)
-    r1.num_computed_tokens = plan.repair_span[0]
-    # Stand one deferral away from the bound, then defer once more
-    # through the real budget path (num_new_tokens below the span is
-    # exactly what the dynamic caps -- encoder budgets, lookahead
-    # reserves, mamba alignment -- produce).
-    plan.num_deferrals = Scheduler.REPAIR_MAX_ADMISSION_DEFERRALS - 1
-    verdict = scheduler._recovery_plan_budget(
-        r1, num_new_tokens=N_EFF - 1, input_budget=8192, draft_slots=0
-    )
-    assert verdict == (0, 0)
+    # The failed async load is REPORTED but the transfer never completes
+    # (no finished_recving): the plan installs on the blocked owner.
+    _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1),
+                    reqs=[r1, r2])
+    assert r1.request_id in scheduler.recovery_plans
+    plan = scheduler.recovery_plans[r1.request_id]
+
+    # Three frozen steps: r2 (a healthy decode request) is skipped while
+    # the plan drains first; the plan ticks once per step.
+    for step in range(3):
+        out = scheduler.schedule()
+        assert r2.request_id not in out.num_scheduled_tokens
+        assert plan.num_deferrals == step + 1
     assert scheduler.recovery_plans == {}
 
-    # The ordinary path owns the request from the rollback boundary.
-    out2 = scheduler.schedule()
-    assert out2.repair_works is None
-    assert out2.num_scheduled_tokens[r1.request_id] == 3328 - 96 * BS
+    # The freeze lifted: r2 schedules again on the very next step.
+    out = scheduler.schedule()
+    assert r2.request_id in out.num_scheduled_tokens
+    assert out.repair_works is None
 
 
-def test_deferral_below_bound_keeps_waiting():
+def test_deferral_below_bound_keeps_waiting(monkeypatch):
     """The mirror of the bound: a deferral below the bound keeps the
-    plan pending (the budget call returns None and the freeze holds)
-    -- the bound must not dissolve plans eagerly."""
+    plan pending (the freeze holds, the tick counts) -- the bound must
+    not dissolve plans eagerly."""
+    monkeypatch.setattr(Scheduler, "REPAIR_MAX_ADMISSION_DEFERRALS", 32)
     scheduler = make_scheduler(
         kv_load_failure_policy="repair", max_num_batched_tokens=8192
     )
     r1 = create_request(num_tokens=3328)
     scheduler.add_request(r1)
-    admit_sync_external_hit(scheduler, r1, 3072)
-    scheduler.schedule()
-    plan = _plan_installed(scheduler, r1)
+    admit_async_external_hit(scheduler, r1, 3072)
+    out1 = scheduler.schedule()
+    _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1),
+                    reqs=[r1])
+    plan = scheduler.recovery_plans[r1.request_id]
 
-    verdict = scheduler._recovery_plan_budget(
-        r1, num_new_tokens=N_EFF - 1, input_budget=8192, draft_slots=0
-    )
-    assert verdict is None
+    scheduler.schedule()
     assert scheduler.recovery_plans == {r1.request_id: plan}
     assert plan.num_deferrals == 1
 
@@ -314,8 +328,13 @@ def test_dissolving_step_resumes_ordinary_traffic_immediately():
     out2 = scheduler.schedule()
     assert scheduler.recovery_plans == {}
     assert out2.repair_works is None
+    # The freeze does not outlive the plan: r2 (examined after r1 in
+    # the running queue) schedules in the SAME step. r1 itself skips
+    # this one step (the dissolution's zero schedule) and resumes the
+    # next.
     assert r2.request_id in out2.num_scheduled_tokens
-    assert r1.request_id in out2.num_scheduled_tokens
+    out3 = scheduler.schedule()
+    assert r1.request_id in out3.num_scheduled_tokens
 
 
 def test_waiting_queue_plan_admits_repair():

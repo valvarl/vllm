@@ -304,7 +304,9 @@ def test_over_budget_plan_falls_back_to_ordinary_reschedule():
     """E > the whole per-step budget: the plan dissolves (no step can fund
     it -- deferral would starve), the exclusivity constraint lifts within
     the step, and the ordinary rollback-recompute reschedule owns the
-    request at ordinary budget."""
+    request at ordinary budget. The owner skips the dissolution step
+    itself (the zero schedule keeps the plan's threshold exemption from
+    leaking an uncapped chunk) and resumes the next."""
     scheduler = make_scheduler()
     r1 = create_request(num_tokens=3072)
     scheduler.add_request(r1)
@@ -320,8 +322,12 @@ def test_over_budget_plan_falls_back_to_ordinary_reschedule():
     out2 = scheduler.schedule()
 
     assert scheduler.recovery_plans == {}
-    assert out2.num_scheduled_tokens[r1.request_id] == N_EFF
-    assert out2.num_scheduled_tokens[r2.request_id] == BUDGET - N_EFF
+    # The healthy competitor rides the dissolution step (the freeze does
+    # not outlive the plan); the damaged request resumes next step.
+    assert out2.num_scheduled_tokens[r2.request_id] > 0
+    assert r1.request_id not in out2.num_scheduled_tokens
+    out3 = scheduler.schedule()
+    assert out3.num_scheduled_tokens[r1.request_id] > 0
 
 
 def test_plan_first_repairs_before_healthy_running_work():
