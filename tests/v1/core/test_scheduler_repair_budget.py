@@ -402,6 +402,20 @@ def _deliver_report(scheduler, r1, out, report, reqs=None):
     scheduler.update_from_output(out, output)
 
 
+def _sync_claim_scenario_helper():
+    """A repair-policy scheduler with one sync external claim, scheduled:
+    the (scheduler, request, scheduler_output) triple a report delivery
+    needs."""
+    scheduler = make_scheduler(
+        kv_load_failure_policy="repair", enable_prefix_caching=False
+    )
+    r1 = create_request(num_tokens=3328)
+    scheduler.add_request(r1)
+    admit_sync_external_hit(scheduler, r1, 3072)
+    out1 = scheduler.schedule()
+    return scheduler, r1, out1
+
+
 def test_delayed_publication_keeps_sync_claim_private_until_verdict():
     """The flip of the v1 published-block fence: under the repair
     policy + APC ON the sync external-claim blocks are NOT hashed into
@@ -679,10 +693,14 @@ def test_duplicate_verdict_list_consumed_once():
     assert scheduler.recovery_plans == {}
 
 
-def test_duplicate_report_absorbed_divergent_refused():
+def test_duplicate_report_absorbed_divergent_falls_back():
     """The report arm's duplicate handling: an identical report for an
     existing plan is absorbed (idempotent, no second plan); a divergent
-    report names a different region and is refused loudly."""
+    report names a different region and is REFUSED as evidence -- the
+    plan dissolves and the request falls back to the ordinary
+    rollback-recompute path without killing the engine (the hardening
+    contract: broken evidence invalidates the recovery, not the
+    request)."""
     scheduler = make_scheduler(
         kv_load_failure_policy="repair", enable_prefix_caching=False
     )
@@ -700,10 +718,33 @@ def test_duplicate_report_absorbed_divergent_refused():
     assert r1.num_computed_tokens == 96 * BS
 
     divergent = _structured_report(
-        scheduler, r1, token_span=(97 * BS, 98 * BS), rollback_boundary=97 * BS
+        scheduler, r1, failed_block_idx=97,
+        token_span=(97 * BS, 98 * BS), rollback_boundary=97 * BS,
     )
-    with pytest.raises(RuntimeError, match="different region"):
-        _deliver_report(scheduler, r1, out1, divergent)
+    # No raise: the divergent evidence dissolves the plan and truncates to
+    # the minimum certified rollback (the plan's 96 blocks, below the
+    # divergent report's own 97).
+    _deliver_report(scheduler, r1, out1, divergent)
+    assert scheduler.recovery_plans == {}
+    assert r1.num_computed_tokens == 96 * BS
+
+    # A divergent report that is ALSO malformed (its span/block claim does
+    # not correspond) is uninterpretable down to the rollback boundary:
+    # the full-recompute floor applies.
+    scheduler2, r2, out2 = _sync_claim_scenario_helper()
+    _deliver_report(scheduler2, r2, out2, _structured_report(scheduler2, r2))
+    malformed_divergent = _structured_report(
+        scheduler2, r2, token_span=(97 * BS, 98 * BS), rollback_boundary=97 * BS
+    )
+    _deliver_report(scheduler2, r2, out2, malformed_divergent)
+    assert scheduler2.recovery_plans == {}
+    assert r2.num_computed_tokens == 0
+
+    # The engine keeps scheduling: the ordinary recompute path owns the
+    # request from the rollback boundary.
+    out2 = scheduler.schedule()
+    assert out2.num_scheduled_tokens[r1.request_id] == 3328 - 96 * BS
+    assert out2.repair_works is None
 
 
 def test_abort_evicts_failed_span_from_prefix_cache():
@@ -884,9 +925,17 @@ def test_report_validation_battery_rejects_malformed_geometry():
         ),
     }
     for name, (report, message) in cases.items():
-        with pytest.raises(RuntimeError, match=message):
-            _deliver_report(scheduler, r1, out1, report)
+        # No raise (the hardening contract): a malformed report is a
+        # request-scoped fail-closed fallback -- logged at ERROR,
+        # recovery refused, full recompute -- never an engine-wide
+        # crash. The scheduler keeps serving afterwards.
+        _deliver_report(scheduler, r1, out1, report, reqs=[r1, r2])
         assert scheduler.recovery_plans == {}, f"plan leaked after {name}"
+        assert r1.num_computed_tokens == 0, f"not reset to recompute after {name}"
+
+    # The engine keeps scheduling after every malformed report.
+    out2 = scheduler.schedule()
+    assert r1.request_id in out2.num_scheduled_tokens
 
 
 def _admitted_repair_plan():

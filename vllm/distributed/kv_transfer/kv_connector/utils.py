@@ -107,7 +107,7 @@ class KVOutputAggregator:
         # the correct merge.
         load_failure_reports: list[KVLoadFailureReport] = []
         repair_results: list[RepairResultReport] = []
-        for model_runner_output in outputs:
+        for rank, model_runner_output in enumerate(outputs):
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
             if not kv_output:
@@ -170,6 +170,14 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
             self._failed_recving_pending |= kv_output.failed_recving
+            for report in kv_output.load_failure_reports or []:
+                # Rank attribution for the scheduler's cross-rank report
+                # consensus: identical duplicates of one fault arrive from
+                # every rank and are absorbed; the tag lets a divergent
+                # pair name the conflicting workers in its diagnostics.
+                # Connectors never set it -- only this aggregation does.
+                if report.source_rank is None:
+                    report.source_rank = rank
             load_failure_reports.extend(kv_output.load_failure_reports or [])
             repair_results.extend(kv_output.repair_results or [])
 

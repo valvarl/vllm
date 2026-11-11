@@ -229,6 +229,12 @@ class KVLoadFailureReport:
     # The pre-failure external computed count C: the restoration target
     # at the repair commit.
     restored_extent: int
+    # Diagnostic only (set by the TP output aggregator, never by the
+    # connector): the index of the reporting worker in the gathered
+    # per-rank outputs. Two reports of one fault from different ranks
+    # are identical duplicates that differ only in this tag; the
+    # scheduler's evidence comparison excludes it.
+    source_rank: int | None = None
 
 
 @dataclass
@@ -260,6 +266,12 @@ class RepairResultReport:
     aborted: bool = False
     # The per-element commit-check detail (diagnostics).
     commit_check: dict[str, bool] | None = None
+    # Diagnostic only: the type and message of the first rank-local
+    # exception the worker's failure envelope contained (None on every
+    # clean run). The full traceback lives in the worker log; this field
+    # survives to the scheduler side so an abort's root cause is visible
+    # even when worker logs are lost.
+    error_detail: str | None = None
 
 
 @dataclass

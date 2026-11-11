@@ -123,6 +123,10 @@ class RecoveryPlan:
     # The plan identity: echoed by the repair result; a mismatched echo is
     # a stale/duplicate result and is rejected.
     plan_id: int = -1
+    # The evidence identity of the report that built this plan
+    # (Scheduler._report_evidence_key): the duplicate-absorption key for
+    # same-step re-deliveries of the same fault across TP ranks.
+    report_evidence: tuple | None = None
     # The execution epoch: the scheduler step at which the plan was
     # admitted. A result echoing a different epoch is stale (the
     # overlapping-step rejection).
@@ -669,21 +673,69 @@ class Scheduler(SchedulerInterface):
             # queued ahead of any later step, and a missing result is
             # synthesized as a failed verdict at that step's update.
             return None
+        # Static never-admissible gate. The running arm reserves the
+        # plan's full equivalent-token charge before the span cap (the
+        # v1 constraint: budget - E >= n_eff, i.e. E + n_eff must fit
+        # the input budget beside the draft slots); the waiting arm has
+        # no reserve, so only the larger of the two charges must fit.
+        # A plan no step could ever fund (spec-decode draft slots
+        # reserving head-room, a scheduled-tokens cap below the span)
+        # dissolves immediately instead of deferring forever while the
+        # pending-plan drain freezes the whole engine.
+        if request.status == RequestStatus.RUNNING:
+            never_fits = (
+                plan.est_equivalent_tokens + plan.n_eff + draft_slots
+                > input_budget
+            )
+        else:
+            never_fits = (
+                max(plan.est_equivalent_tokens, plan.n_eff) + draft_slots
+                > input_budget
+            )
         if (
-            plan.est_equivalent_tokens
+            never_fits
+            or plan.est_equivalent_tokens
             > self.scheduler_config.max_num_batched_tokens
             or plan.n_eff > self.max_num_scheduled_tokens
         ):
-            self.recovery_plans.pop(request.request_id)
+            self._dissolve_recovery_plan(plan, "cannot fit any step budget")
             return num_new_tokens, 0
         # The repair step schedules exactly the repair span.
         num_new_tokens = min(num_new_tokens, plan.n_eff)
         surcharge = max(0, plan.est_equivalent_tokens - plan.n_eff)
         num_new_tokens = min(num_new_tokens, input_budget - draft_slots - surcharge)
         if num_new_tokens < plan.n_eff:
+            # Bounded deferral. A DETECTED plan freezes every other
+            # request of its steps (the drain-first exclusivity), so an
+            # unbounded deferral is an engine-wide stall, not just a
+            # per-request one. After REPAIR_MAX_ADMISSION_DEFERRALS
+            # consecutive steps without admission, the plan dissolves
+            # and the ordinary rollback-recompute path -- which chunks
+            # and always makes progress -- owns the request.
             plan.num_deferrals += 1
+            if plan.num_deferrals >= self.REPAIR_MAX_ADMISSION_DEFERRALS:
+                self._dissolve_recovery_plan(plan, "admission deferral bound")
+                return 0, 0
             return None
         return num_new_tokens, surcharge
+
+    def _dissolve_recovery_plan(self, plan: RecoveryPlan, reason: str) -> None:
+        """Drop a DETECTED plan and hand the request to the ordinary
+        rollback-recompute path (num_computed_tokens already sits at the
+        rollback boundary). The request keeps running; only the repair
+        attempt is abandoned."""
+        self.recovery_plans.pop(plan.request_id, None)
+        logger.warning(
+            "Repair plan dissolved: req=%s plan_id=%d span=%s E=%d "
+            "deferrals=%d (%s) -> the ordinary recompute path owns the "
+            "request",
+            plan.request_id,
+            plan.plan_id,
+            plan.repair_span,
+            plan.est_equivalent_tokens,
+            plan.num_deferrals,
+            reason,
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -827,11 +879,20 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < long_prefill_token_threshold < num_new_tokens:
+            _pending_plan = self.recovery_plans.get(request.request_id)
+            if (
+                0 < long_prefill_token_threshold < num_new_tokens
+                # A pending repair plan is exempt from the long-prefill
+                # cap: its step is exclusive (ordinary work is frozen
+                # while the plan drains first), so the cap's starvation
+                # protection has no one to protect, and the repair span
+                # cannot be chunked -- capping it below n_eff would
+                # defer the plan (and freeze the engine) forever.
+                and _pending_plan is None
+            ):
                 num_new_tokens = long_prefill_token_threshold
             # Reserve the pending plan's equivalent-token charge before the
             # cap, or the later surcharge debit would not fit the budget.
-            _pending_plan = self.recovery_plans.get(request.request_id)
             _repair_reserve = (
                 _pending_plan.est_equivalent_tokens
                 if (
@@ -1319,7 +1380,15 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    if 0 < long_prefill_token_threshold < num_new_tokens:
+                    if (
+                        0 < long_prefill_token_threshold < num_new_tokens
+                        # Pending repair plans are exempt from the
+                        # long-prefill cap in the waiting arm for the
+                        # same reason as the running arm: the repair
+                        # step is exclusive and cannot be chunked below
+                        # its span.
+                        and self.recovery_plans.get(request.request_id) is None
+                    ):
                         num_new_tokens = long_prefill_token_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
@@ -3664,19 +3733,61 @@ class Scheduler(SchedulerInterface):
     # term (a conservative placeholder).
     REPAIR_LAYER_EQ_TOKENS = 32
 
+    # The admission-deferral bound for a DETECTED recovery plan. A pending
+    # plan is the drain-first admission of its steps: every OTHER request
+    # is frozen while the plan waits for a budget it can fit, so an
+    # unbounded deferral is an engine-wide stall rather than a
+    # per-request one. At the bound the plan dissolves and the ordinary
+    # rollback-recompute path (which chunks, and therefore always makes
+    # progress) owns the request. 32 steps bounds the extra recovery
+    # latency to roughly 0.3-3 s at typical engine cadences (10-100 ms
+    # per step) while riding out transient pressure -- preemption
+    # cascades, connector drains, bursty prefills -- that resolves
+    # within a few scheduling rounds. Not a public knob: the fallback it
+    # arms (full recompute) is always correct, only more expensive.
+    REPAIR_MAX_ADMISSION_DEFERRALS = 32
+
     def _repair_estimate(self, n_eff: int, layer_end: int) -> int:
         n_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
         return math.ceil(
             n_eff * layer_end / n_layers + layer_end * self.REPAIR_LAYER_EQ_TOKENS
         )
 
+    @staticmethod
+    def _report_evidence_key(report: KVLoadFailureReport) -> tuple:
+        """The report's evidence identity: every failure-describing field
+        except the diagnostic source_rank tag. Two reports with equal keys
+        are the SAME evidence -- the identical duplicate every TP rank
+        produces for one fault -- while different keys for one request
+        are divergent evidence that no single recovery can represent."""
+        return (
+            report.request_id,
+            tuple(report.failed_block_ids),
+            report.token_span,
+            report.rollback_boundary,
+            tuple(report.observed_failed_layers),
+            report.healthy_above_span,
+            report.restored_extent,
+        )
+
     def _handle_repair_reports(
         self, reports: list[KVLoadFailureReport]
     ) -> set[str]:
-        """Consume structured load-failure reports under the repair policy:
-        truncate each affected request to its rollback boundary, install
-        the RecoveryPlan, and return the ids whose (garbage) outputs from
-        the detection step must be skipped."""
+        """Consume structured load-failure reports under the repair policy.
+
+        Two passes per request. The consensus pass groups the step's
+        reports by request and folds identical duplicates (every TP rank
+        reports the same fault; the aggregator concatenates the per-rank
+        lists, so one fault arrives N times): a request keeps at most one
+        piece of evidence. Divergent evidence -- reports naming different
+        regions, or the same region with different metadata -- is never
+        merged and never authorizes a recovery: the request falls back to
+        the ordinary rollback-recompute path (see
+        _reject_uninterpretable_reports) and the engine stays alive. The
+        install pass is unchanged: truncate to the rollback boundary,
+        install the RecoveryPlan, and return the ids whose (garbage)
+        outputs from the detection step must be skipped.
+        """
         if not self.repair_kv_load_failures:
             policy = self.vllm_config.kv_transfer_config.kv_load_failure_policy
             raise RuntimeError(
@@ -3685,9 +3796,59 @@ class Scheduler(SchedulerInterface):
                 "is required to consume reports."
             )
         skip_req_ids: set[str] = set()
+        by_request: dict[str, list[KVLoadFailureReport]] = {}
         for report in reports:
-            if not self._assert_repair_preconditions(report):
+            by_request.setdefault(report.request_id, []).append(report)
+        for req_id, req_reports in by_request.items():
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
                 continue
+            if req_id in self.recovery_plans:
+                # A plan already owns this request. Reports matching the
+                # plan's evidence are same-step duplicates (absorbed);
+                # anything else diverges from the evidence the plan was
+                # built on and dissolves it.
+                plan = self.recovery_plans[req_id]
+                divergent = [
+                    r
+                    for r in req_reports
+                    if self._report_evidence_key(r) != plan.report_evidence
+                ]
+                if divergent:
+                    self._reject_uninterpretable_reports(
+                        request,
+                        divergent,
+                        "divergent against the pending plan",
+                        skip_req_ids,
+                        trusted_rollback=plan.repair_span[0],
+                    )
+                continue
+            rejection = next(
+                (
+                    reason
+                    for r in req_reports
+                    if (reason := self._validate_load_failure_report(r)) is not None
+                ),
+                None,
+            )
+            if rejection is not None:
+                # Malformed evidence: even the rollback boundary is
+                # untrustworthy. Fail closed to a full recompute.
+                self._reject_uninterpretable_reports(
+                    request, req_reports, "malformed (" + rejection + ")", skip_req_ids
+                )
+                continue
+            unique: list[KVLoadFailureReport] = []
+            for report in req_reports:
+                key = self._report_evidence_key(report)
+                if all(self._report_evidence_key(u) != key for u in unique):
+                    unique.append(report)
+            if len(unique) > 1:
+                self._reject_uninterpretable_reports(
+                    request, unique, "divergent", skip_req_ids
+                )
+                continue
+            report = unique[0]
             request = self.requests[report.request_id]
             rollback, corrupt_end = (
                 report.rollback_boundary,
@@ -3725,6 +3886,7 @@ class Scheduler(SchedulerInterface):
                 healthy_above_span=report.healthy_above_span,
                 failed_block_ids=list(report.failed_block_ids),
                 plan_id=self._next_repair_plan_id,
+                report_evidence=self._report_evidence_key(report),
             )
             self.recovery_plans[report.request_id] = plan
             skip_req_ids.add(report.request_id)
@@ -3794,50 +3956,43 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.evict_blocks(blocks_to_evict)
         request.num_computed_tokens = report.rollback_boundary
 
-    def _assert_repair_preconditions(self, report: KVLoadFailureReport) -> bool:
+    def _validate_load_failure_report(self, report: KVLoadFailureReport) -> str | None:
+        """The report's geometry battery. Returns None when the report is
+        a well-formed single-region failure description for a live
+        request, and a human-readable rejection reason otherwise. The
+        caller owns the failure mode: a malformed report is a connector
+        contract violation, logged at ERROR and answered with the
+        request-scoped recompute fallback -- loud enough to monitor,
+        never an engine-wide crash."""
         request = self.requests.get(report.request_id)
         if request is None or request.is_finished():
-            return False
-        if report.request_id in self.recovery_plans:
-            # Single-region law: an existing plan absorbs an identical
-            # report and refuses a divergent one loudly.
-            existing = self.recovery_plans[report.request_id]
-            if existing.repair_span != (
-                report.rollback_boundary,
-                report.token_span[1],
-            ):
-                raise RuntimeError(
-                    f"A second load-failure report for {report.request_id} "
-                    "names a different region; multi-region repair is not "
-                    "supported (the failure-policy fallback applies)."
-                )
-            return False
+            return "request is unknown or finished"
         if len(report.failed_block_ids) != 1:
-            raise RuntimeError(
-                f"load-failure report for {report.request_id} names "
-                f"{len(report.failed_block_ids)} blocks; v1 repair supports "
-                "exactly one failed region."
+            return (
+                "names "
+                + str(len(report.failed_block_ids))
+                + " blocks; v1 repair supports exactly one failed region"
             )
         if not (
             report.rollback_boundary <= report.token_span[0]
             and report.token_span[1] <= report.restored_extent
             and report.token_span[0] < report.token_span[1]
         ):
-            raise RuntimeError(
-                f"Malformed load-failure report for {report.request_id}: "
-                f"span={report.token_span} rollback={report.rollback_boundary} "
-                f"restored_extent={report.restored_extent}"
+            return (
+                "malformed geometry: span="
+                + str(report.token_span)
+                + " rollback="
+                + str(report.rollback_boundary)
+                + " restored_extent="
+                + str(report.restored_extent)
             )
-        # A report whose geometry does not check out is a connector
-        # contract violation: refuse loudly so the malformed shape never
-        # reaches the repair machinery.
         (req_block_ids,) = self.kv_cache_manager.get_block_ids(report.request_id)
         for block_id in report.failed_block_ids:
             if block_id not in req_block_ids:
-                raise RuntimeError(
-                    f"load-failure report for {report.request_id} names "
-                    f"block {block_id} which is not in the reporting "
-                    "request's block table (block ownership violation)."
+                return (
+                    "names block "
+                    + str(block_id)
+                    + " which is not in the reporting request's block table"
                 )
         bs = self.block_size
         if (
@@ -3845,36 +4000,100 @@ class Scheduler(SchedulerInterface):
             or report.token_span[0] % bs
             or report.token_span[1] % bs
         ):
-            raise RuntimeError(
-                f"load-failure report for {report.request_id} is not "
-                f"block-aligned (block_size={bs}): "
-                f"span={report.token_span} "
-                f"rollback={report.rollback_boundary}"
+            return (
+                "not block-aligned (block_size=" + str(bs) + "): span="
+                + str(report.token_span)
+                + " rollback="
+                + str(report.rollback_boundary)
             )
         n_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
         if not report.observed_failed_layers or any(
-            not (0 <= layer < n_layers)
-            for layer in report.observed_failed_layers
+            not (0 <= layer < n_layers) for layer in report.observed_failed_layers
         ):
-            raise RuntimeError(
-                f"load-failure report for {report.request_id} carries "
-                f"invalid failed-layer information "
-                f"{report.observed_failed_layers!r} (model has "
-                f"{n_layers} layers)."
+            return (
+                "invalid failed-layer information "
+                + repr(report.observed_failed_layers)
+                + " (model has "
+                + str(n_layers)
+                + " layers)"
             )
         span_first = report.token_span[0] // bs
         span_last = -(-report.token_span[1] // bs)
-        if list(req_block_ids[span_first:span_last]) != list(
-            report.failed_block_ids
-        ):
-            raise RuntimeError(
-                f"load-failure report for {report.request_id}: the span "
-                f"{report.token_span} maps to blocks "
-                f"{req_block_ids[span_first:span_last]} but the report "
-                f"claims {report.failed_block_ids} (token-span/block-ID "
-                "correspondence violation)."
+        if list(req_block_ids[span_first:span_last]) != list(report.failed_block_ids):
+            return (
+                "the span "
+                + str(report.token_span)
+                + " maps to blocks "
+                + str(list(req_block_ids[span_first:span_last]))
+                + " but the report claims "
+                + str(report.failed_block_ids)
             )
-        return True
+        return None
+
+    def _reject_uninterpretable_reports(
+        self,
+        request: Request,
+        reports: list[KVLoadFailureReport],
+        reason: str,
+        skip_req_ids: set[str],
+        trusted_rollback: int | None = None,
+    ) -> None:
+        """Request-scoped fail-closed fallback for uninterpretable report
+        evidence (malformed, or divergent across ranks).
+
+        Recovery is REFUSED -- conflicting or malformed evidence is never
+        merged into an authorization. The request truncates to the
+        largest boundary every well-formed report independently certifies
+        as healthy (the minimum rollback boundary; zero when the evidence
+        is malformed), everything from that boundary to the request's
+        last block is evicted so no future request matches untrusted
+        content, and the ordinary rollback-recompute path owns the
+        request from here. The engine stays alive: broken evidence
+        invalidates the recovery attempt, not the request.
+        """
+        self.recovery_plans.pop(request.request_id, None)
+        well_formed = [
+            r for r in reports if self._validate_load_failure_report(r) is None
+        ]
+        # The truncation boundary: every well-formed report independently
+        # certifies [0, its rollback) healthy on its rank, so the minimum
+        # rollback is healthy on ALL reporting ranks. A rollback already
+        # certified by an installed plan (the divergent-against-plan
+        # shape) joins the minimum as trusted evidence.
+        certified = [r.rollback_boundary for r in well_formed]
+        if trusted_rollback is not None and well_formed:
+            certified.append(trusted_rollback)
+        rollback = min(certified) if certified else 0
+        (req_block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
+        evict_from = rollback // self.block_size if well_formed else 0
+        blocks_to_evict = set(req_block_ids[evict_from:])
+        self.kv_cache_manager.evict_blocks(blocks_to_evict)
+        request.num_computed_tokens = rollback
+        # The async schedule-ahead may have left placeholder accounting
+        # for in-flight steps whose outputs are now suppressed.
+        request.num_output_placeholders = 0
+        skip_req_ids.add(request.request_id)
+        logger.error(
+            "KV repair refused: %s report evidence for req=%s -- failing "
+            "closed to the recompute fallback (rollback=%d, evicted=%d). "
+            "Conflicting evidence: %s",
+            reason,
+            request.request_id,
+            rollback,
+            len(blocks_to_evict),
+            [
+                {
+                    "source_rank": r.source_rank,
+                    "token_span": r.token_span,
+                    "rollback_boundary": r.rollback_boundary,
+                    "failed_block_ids": r.failed_block_ids,
+                    "restored_extent": r.restored_extent,
+                    "healthy_above_span": r.healthy_above_span,
+                    "observed_failed_layers": r.observed_failed_layers,
+                }
+                for r in reports
+            ],
+        )
 
     def _consume_repair_result(
         self, result: RepairResultReport
