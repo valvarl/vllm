@@ -29,7 +29,6 @@ sizes 2 and 3) lives in test_repair_tp_consensus.py.
 from unittest.mock import patch
 
 import pytest
-import torch
 
 from tests.v1.kv_connector.unit.utils import create_vllm_config
 from tests.v1.worker.test_repair_commit_checks import (
@@ -100,13 +99,12 @@ def test_positions_fetch_failure_converges_to_failed_verdict():
         def __getitem__(self, idx):
             raise RuntimeError("injected positions fetch failure")
 
-    collected = []
-    with patch(
-        "torch.distributed.all_gather", _counting_all_gather(collected)
-    ), _fake_tp_ctx():
-        results = _run(
-            model, works, tokens, _BoomPositions(), input_ids, meta
-        )
+    collected: list[tuple[int, ...]] = []
+    with (
+        patch("torch.distributed.all_gather", _counting_all_gather(collected)),
+        _fake_tp_ctx(),
+    ):
+        results = _run(model, works, tokens, _BoomPositions(), input_ids, meta)
 
     assert all(r.aborted for r in results)
     assert all(not r.structural_check for r in results)
@@ -129,10 +127,11 @@ def test_fence_host_fetch_failure_converges_to_failed_verdict():
         block_tables=_BoomTables(meta.block_tables),
         slot_mapping=meta.slot_mapping,
     )
-    collected = []
-    with patch(
-        "torch.distributed.all_gather", _counting_all_gather(collected)
-    ), _fake_tp_ctx():
+    collected: list[tuple[int, ...]] = []
+    with (
+        patch("torch.distributed.all_gather", _counting_all_gather(collected)),
+        _fake_tp_ctx(),
+    ):
         results = _run(model, works, tokens, positions, input_ids, bad_meta)
 
     assert all(r.aborted for r in results)
@@ -149,11 +148,12 @@ def test_embedding_failure_converges_to_failed_verdict():
     def boom_embed(input_ids):
         raise RuntimeError("injected embedding failure")
 
-    model.model.embed_input_ids = boom_embed
-    collected = []
-    with patch(
-        "torch.distributed.all_gather", _counting_all_gather(collected)
-    ), _fake_tp_ctx():
+    model.model.embed_input_ids = boom_embed  # type: ignore[method-assign]
+    collected: list[tuple[int, ...]] = []
+    with (
+        patch("torch.distributed.all_gather", _counting_all_gather(collected)),
+        _fake_tp_ctx(),
+    ):
         results = _run(model, works, tokens, positions, input_ids, meta)
 
     assert all(r.aborted for r in results)
@@ -207,10 +207,11 @@ def test_rezero_failure_converges_to_failed_verdict(monkeypatch):
         raise RuntimeError("injected re-zero failure")
 
     monkeypatch.setattr(mixin, "_rezero_repair_span", boom_rezero)
-    collected = []
-    with patch(
-        "torch.distributed.all_gather", _counting_all_gather(collected)
-    ), _fake_tp_ctx():
+    collected: list[tuple[int, ...]] = []
+    with (
+        patch("torch.distributed.all_gather", _counting_all_gather(collected)),
+        _fake_tp_ctx(),
+    ):
         results = _run(model, works, tokens, positions, input_ids, meta)
 
     ra, rb = results
@@ -245,10 +246,11 @@ def test_envelope_never_skips_the_collective_multi_work():
 
     model.model.layers[0] = _BoomFirstWork("model.layers.0")
 
-    collected = []
-    with patch(
-        "torch.distributed.all_gather", _counting_all_gather(collected)
-    ), _fake_tp_ctx():
+    collected: list[tuple[int, ...]] = []
+    with (
+        patch("torch.distributed.all_gather", _counting_all_gather(collected)),
+        _fake_tp_ctx(),
+    ):
         results = _run(
             model, works, tokens, positions, input_ids, meta, ["req-a", "req-b"]
         )
@@ -272,9 +274,7 @@ def test_missing_forward_context_converges_to_failed_verdict():
     model = _FakeModel(n_layers=4)
     sub = _sub_output(works, tokens)
 
-    with set_forward_context(
-        {}, create_vllm_config(model="unsloth/Llama-3.2-1B")
-    ):
+    with set_forward_context({}, create_vllm_config(model="unsloth/Llama-3.2-1B")):
         results = execute_repair_only(
             model, sub, input_ids, positions, ["req-a", "req-b"]
         )
@@ -305,6 +305,7 @@ def test_error_detail_preserves_original_exception_type_and_message():
     assert rb.error_detail.startswith("ValueError:")
     assert "very specific kernel failure xyz" in rb.error_detail
 
+
 # ---- H6: the review-response hardening ----
 
 
@@ -317,12 +318,18 @@ def test_step_level_validation_failure_still_verdicts():
     collective."""
     works, tokens, positions, input_ids, meta = _multi_work_setup()
     model = _FakeModel(n_layers=4)
-    collected = []
-    with patch(
-        "torch.distributed.all_gather", _counting_all_gather(collected)
-    ), _fake_tp_ctx():
+    collected: list[tuple[int, ...]] = []
+    with (
+        patch("torch.distributed.all_gather", _counting_all_gather(collected)),
+        _fake_tp_ctx(),
+    ):
         results = _run(
-            model, works, tokens, positions, input_ids, meta,
+            model,
+            works,
+            tokens,
+            positions,
+            input_ids,
+            meta,
             ["req-a", "req-b", "req-FORBIDDEN"],
         )
 
@@ -371,17 +378,18 @@ def test_work_lookup_failure_converges_to_placeholder_verdict():
         free_encoder_mm_hashes=[],
         repair_works=boom_works,
     )
-    collected = []
-    with patch(
-        "torch.distributed.all_gather", _counting_all_gather(collected)
-    ), _fake_tp_ctx():
-        with set_forward_context(
+    collected: list[tuple[int, ...]] = []
+    with (
+        patch("torch.distributed.all_gather", _counting_all_gather(collected)),
+        _fake_tp_ctx(),
+        set_forward_context(
             {"model.layers.0": meta},
             create_vllm_config(model="unsloth/Llama-3.2-1B"),
-        ):
-            results = execute_repair_only(
-                model, sub, input_ids, positions, ["req-a", "req-b"]
-            )
+        ),
+    ):
+        results = execute_repair_only(
+            model, sub, input_ids, positions, ["req-a", "req-b"]
+        )
 
     ra, rb = results
     # req-a: placeholder failed verdict -- no identity, aborted, the
@@ -409,7 +417,5 @@ def test_need_eager_forces_none_cudagraph_mode():
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 
-    batch_desc, _ = dispatch_cg_and_sync_dp(
-        None, 1, 16, None, 1, 0, need_eager=True
-    )
+    batch_desc, _ = dispatch_cg_and_sync_dp(None, 1, 16, None, 1, 0, need_eager=True)
     assert batch_desc.cg_mode == CUDAGraphMode.NONE

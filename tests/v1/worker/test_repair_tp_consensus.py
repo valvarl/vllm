@@ -36,6 +36,7 @@ end-to-end validation (the RFC evidence base); a dedicated NPU
 regression for the consensus belongs with the device CI.
 """
 
+import contextlib
 import time
 from datetime import timedelta
 
@@ -210,10 +211,8 @@ def _skip_worker(rank, world_size, port, result_queue):
     finally:
         if _had_npu:
             torch.npu.is_available = _npu_available
-        try:
+        with contextlib.suppress(Exception):
             dist.destroy_process_group()
-        except Exception:
-            pass
 
 
 def _run_distributed(worker_fn, world_size):
@@ -225,20 +224,16 @@ def _run_distributed(worker_fn, world_size):
     result_queue = ctx.Queue()
     port = get_open_port()
     procs = [
-        ctx.Process(
-            target=worker_fn, args=(rank, world_size, port, result_queue)
-        )
+        ctx.Process(target=worker_fn, args=(rank, world_size, port, result_queue))
         for rank in range(world_size)
     ]
     for p in procs:
         p.start()
     deadline = time.monotonic() + _WATCHDOG_S
-    results = []
+    results: list[tuple[int, str | None, object]] = []
     while len(results) < world_size and time.monotonic() < deadline:
-        try:
+        with contextlib.suppress(Exception):
             results.append(result_queue.get(timeout=1.0))
-        except Exception:
-            pass
     for p in procs:
         if p.is_alive():
             p.terminate()
@@ -265,14 +260,12 @@ def test_tp_consensus_matrix(world_size):
         assert err is None, f"rank {rank} raised inside the matrix: {err}"
 
     matrix = _consensus_matrix(world_size)
-    per_scenario = {name: set() for name, _, _ in matrix}
+    per_scenario: dict[str, set[bool]] = {name: set() for name, _, _ in matrix}
     for rank in range(world_size):
         outcomes = by_rank[rank][1]
         assert outcomes is not None
         assert len(outcomes) == len(matrix)
-        for (name, got, expected), (mname, _, mexpected) in zip(
-            outcomes, matrix
-        ):
+        for (name, got, expected), (mname, _, mexpected) in zip(outcomes, matrix):
             assert name == mname
             assert got == expected, (
                 f"ws={world_size} rank={rank} scenario={name}: "
@@ -311,7 +304,7 @@ def test_tp_consensus_missing_rank_times_out():
 
 
 def test_single_rank_consensus_semantics():
-    """ws == 1 reduces to the local summary being a success -- the same
+    """Ws == 1 reduces to the local summary being a success -- the same
     predicate the multi-rank loop derives from the gathered summaries
     (the pre-hardening code returned True unconditionally here, so a
     single-rank fence refusal or backend failure never failed

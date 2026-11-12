@@ -126,7 +126,6 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
-from vllm.v1.worker.kv_connector_model_runner_mixin import execute_repair_only
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -171,6 +170,7 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchState,
     maybe_build_ubatch_runner,
 )
+from vllm.v1.worker.kv_connector_model_runner_mixin import execute_repair_only
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
@@ -2062,8 +2062,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_runner_output = ModelRunnerOutput(
                 req_ids=list(scheduler_output.repair_works.keys()),
                 req_id_to_index={
-                    req_id: i
-                    for i, req_id in enumerate(scheduler_output.repair_works)
+                    req_id: i for i, req_id in enumerate(scheduler_output.repair_works)
                 },
                 sampled_token_ids=None,  # type: ignore[arg-type]
                 logprobs=None,

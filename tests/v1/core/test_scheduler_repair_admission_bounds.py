@@ -29,8 +29,8 @@ import pytest
 
 from tests.v1.core.test_scheduler_repair_budget import (
     BS,
-    E,
     N_EFF,
+    E,
     _deliver_report,
     _structured_report,
     admit_async_external_hit,
@@ -91,9 +91,7 @@ def test_static_never_admissible_plan_dissolves_immediately():
     assert r1.request_id in out1.num_scheduled_tokens
 
     # n_eff = 4992 > input_budget 4096 but <= max_num_scheduled_tokens.
-    plan = _plan_installed(
-        scheduler, r1, e=1500, span=(96 * BS, 96 * BS + 4992)
-    )
+    plan = _plan_installed(scheduler, r1, e=1500, span=(96 * BS, 96 * BS + 4992))
     r1.num_computed_tokens = plan.repair_span[0]
     out2 = scheduler.schedule()
     # Dissolved: no repair work, and the owner skips THIS step (the
@@ -189,8 +187,9 @@ def test_deferral_bound_dissolves_blocked_owner(monkeypatch):
 
     # The failed async load is REPORTED but the transfer never completes
     # (no finished_recving): the plan installs on the blocked owner.
-    _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1),
-                    reqs=[r1, r2])
+    _deliver_report(
+        scheduler, r1, out1, _structured_report(scheduler, r1), reqs=[r1, r2]
+    )
     assert r1.request_id in scheduler.recovery_plans
     plan = scheduler.recovery_plans[r1.request_id]
 
@@ -220,8 +219,7 @@ def test_deferral_below_bound_keeps_waiting(monkeypatch):
     scheduler.add_request(r1)
     admit_async_external_hit(scheduler, r1, 3072)
     out1 = scheduler.schedule()
-    _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1),
-                    reqs=[r1])
+    _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1), reqs=[r1])
     plan = scheduler.recovery_plans[r1.request_id]
 
     scheduler.schedule()
@@ -351,9 +349,7 @@ def test_waiting_queue_plan_admits_repair():
 
     fail_and_truncate(scheduler, r1, out1, failed_block_idx=96)
     (block_ids,) = scheduler.kv_cache_manager.get_block_ids(r1.request_id)
-    plan = install_plan(
-        scheduler, r1, E, failed_block_ids=[block_ids[96]]
-    )
+    plan = install_plan(scheduler, r1, E, failed_block_ids=[block_ids[96]])
     out2 = scheduler.schedule()
     assert plan.state == "ADMITTED"
     assert out2.repair_works is not None

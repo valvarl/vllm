@@ -25,7 +25,6 @@ from tests.v1.kv_connector.unit.utils import (
     create_scheduler,
     create_vllm_config,
 )
-from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import RecoveryPlan, Scheduler
 from vllm.v1.outputs import KVConnectorOutput, KVLoadFailureReport, RepairResultReport
 from vllm.v1.request import Request, RequestStatus
@@ -63,8 +62,8 @@ def admit_async_external_hit(
 ) -> None:
     """One connector Mock answering a full-prompt async external hit."""
     scheduler.connector = Mock()
-    scheduler.connector.get_num_new_matched_tokens.side_effect = (
-        lambda req, _: ((num_tokens, True) if req is request else (0, False))
+    scheduler.connector.get_num_new_matched_tokens.side_effect = lambda req, _: (
+        (num_tokens, True) if req is request else (0, False)
     )
     scheduler.connector.request_finished.return_value = (False, None)
     scheduler.connector.take_events.return_value = ()
@@ -76,8 +75,8 @@ def admit_sync_external_hit(
     """One connector Mock answering a sync external hit: the request is
     admitted RUNNING with the external tokens committed as computed."""
     scheduler.connector = Mock()
-    scheduler.connector.get_num_new_matched_tokens.side_effect = (
-        lambda req, _: ((num_tokens, False) if req is request else (0, False))
+    scheduler.connector.get_num_new_matched_tokens.side_effect = lambda req, _: (
+        (num_tokens, False) if req is request else (0, False)
     )
     scheduler.connector.request_finished.return_value = (False, None)
     scheduler.connector.take_events.return_value = ()
@@ -401,9 +400,7 @@ def _structured_report(scheduler, r1, failed_block_idx=96, **overrides):
 
 
 def _deliver_report(scheduler, r1, out, report, reqs=None):
-    output = create_model_runner_output(
-        reqs=reqs or [r1], use_eos=False
-    )
+    output = create_model_runner_output(reqs=reqs or [r1], use_eos=False)
     output.kv_connector_output = KVConnectorOutput(load_failure_reports=[report])
     scheduler.update_from_output(out, output)
 
@@ -522,7 +519,7 @@ def test_delayed_publication_publishes_verified_claim_at_update():
     # claim as ordinary prefix-cached blocks.
     r2 = create_request(num_tokens=3328, common_prefix_len=3072)
     scheduler.add_request(r2)
-    out2 = scheduler.schedule()
+    scheduler.schedule()
     (r2_blocks,) = scheduler.kv_cache_manager.get_block_ids(r2.request_id)
     assert set(r1_blocks) & set(r2_blocks)
 
@@ -660,7 +657,7 @@ def test_duplicate_repair_result_rejected_after_commit():
     out1 = scheduler.schedule()
     fail_and_truncate(scheduler, r1, out1, failed_block_idx=96)
     install_plan(scheduler, r1, E)
-    out2 = scheduler.schedule()
+    scheduler.schedule()
     plan = scheduler.recovery_plans[r1.request_id]
 
     scheduler._consume_repair_result(make_result(r1, True, plan))
@@ -724,8 +721,11 @@ def test_duplicate_report_absorbed_divergent_falls_back():
     assert r1.num_computed_tokens == 96 * BS
 
     divergent = _structured_report(
-        scheduler, r1, failed_block_idx=97,
-        token_span=(97 * BS, 98 * BS), rollback_boundary=97 * BS,
+        scheduler,
+        r1,
+        failed_block_idx=97,
+        token_span=(97 * BS, 98 * BS),
+        rollback_boundary=97 * BS,
     )
     # No raise: the divergent evidence dissolves the plan and truncates to
     # the minimum certified rollback (the plan's 96 blocks, below the
@@ -787,8 +787,13 @@ def test_abort_evicts_failed_span_from_prefix_cache():
     assert work.expected_write_block_ids
 
     drive_repair_result(
-        scheduler, r1, out2, structural_check=False,
-        plan=plan, aborted=True, executed_layers=2,
+        scheduler,
+        r1,
+        out2,
+        structural_check=False,
+        plan=plan,
+        aborted=True,
+        executed_layers=2,
     )
     assert r1.num_computed_tokens == 96 * BS
     assert scheduler.recovery_plans == {}
@@ -856,9 +861,7 @@ def test_unhealthy_above_span_caps_restoration_at_span_end():
 
     out1 = scheduler.schedule()
     _deliver_report(
-        scheduler, r1, out1, _structured_report(
-            scheduler, r1, healthy_above_span=False
-        )
+        scheduler, r1, out1, _structured_report(scheduler, r1, healthy_above_span=False)
     )
     plan = scheduler.recovery_plans[r1.request_id]
     assert plan.healthy_above_span is False
@@ -867,7 +870,11 @@ def test_unhealthy_above_span_caps_restoration_at_span_end():
     assert out2.repair_works is not None
 
     drive_repair_result(
-        scheduler, r1, out2, structural_check=True, plan=plan,
+        scheduler,
+        r1,
+        out2,
+        structural_check=True,
+        plan=plan,
         span=plan.repair_span,
     )
 
@@ -900,9 +907,7 @@ def test_report_validation_battery_rejects_malformed_geometry():
 
     cases = {
         "ownership": (
-            _structured_report(
-                scheduler, r1, failed_block_ids=[foreign_blocks[5]]
-            ),
+            _structured_report(scheduler, r1, failed_block_ids=[foreign_blocks[5]]),
             "block ownership violation",
         ),
         "rollback_alignment": (
@@ -923,7 +928,8 @@ def test_report_validation_battery_rejects_malformed_geometry():
         ),
         "correspondence": (
             _structured_report(
-                scheduler, r1,
+                scheduler,
+                r1,
                 token_span=(95 * BS, 96 * BS),
                 rollback_boundary=95 * BS,
             ),
@@ -1038,7 +1044,11 @@ def test_repair_txn_publishes_only_on_commit():
         assert block_pool.blocks[bid].block_hash is None
 
     drive_repair_result(
-        scheduler, r1, out2, structural_check=True, plan=plan,
+        scheduler,
+        r1,
+        out2,
+        structural_check=True,
+        plan=plan,
         span=plan.repair_span,
     )
 
@@ -1056,7 +1066,7 @@ def test_repair_txn_publishes_only_on_commit():
 
 def test_repair_txn_aborted_never_publishes():
     """An aborted verdict leaves the transaction's blocks unpublished
-    (the abort's eviction un-publishs the span and above; the recompute
+    (the abort's eviction unpublishes the span and above; the recompute
     fallback republishes through the ordinary path after its rewrite)."""
     scheduler, r1, out2, plan = _drive_repair_txn_step()
     block_pool = scheduler.kv_cache_manager.block_pool
@@ -1065,8 +1075,14 @@ def test_repair_txn_aborted_never_publishes():
         assert block_pool.blocks[bid].block_hash is None
 
     drive_repair_result(
-        scheduler, r1, out2, structural_check=False, plan=plan,
-        span=plan.repair_span, aborted=True, executed_layers=2,
+        scheduler,
+        r1,
+        out2,
+        structural_check=False,
+        plan=plan,
+        span=plan.repair_span,
+        aborted=True,
+        executed_layers=2,
     )
 
     assert scheduler._delayed_repair_txn_pubs == set()
@@ -1099,6 +1115,7 @@ def test_pending_plan_suppresses_step_outputs():
 
     assert r1.num_output_tokens == 0
     assert scheduler.recovery_plans[r1.request_id] is plan
+
 
 def test_stale_only_verdict_set_fails_safe():
     """The final audit's FA-1: a verdict set that is ENTIRELY stale (no

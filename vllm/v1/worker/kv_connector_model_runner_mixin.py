@@ -107,9 +107,7 @@ class KVConnectorModelRunnerMixin:
             output.finished_recving = transfer_results.finished_recving
             output.failed_recving = transfer_results.failed_recving
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
-            output.load_failure_reports = (
-                kv_connector.get_load_failure_reports()
-            )
+            output.load_failure_reports = kv_connector.get_load_failure_reports()
 
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
@@ -429,9 +427,7 @@ def execute_repair_only(
             except Exception as exc:
                 if error_detail is None:
                     error_detail = _format_repair_exception(exc)
-                logger.exception(
-                    "Repair TP consensus failed req=%s -> abort", req_id
-                )
+                logger.exception("Repair TP consensus failed req=%s -> abort", req_id)
             results.append(
                 RepairResultReport(
                     request_id=req_id,
@@ -767,9 +763,7 @@ def _slots_owned_by_request(
     of the step's slot mapping."""
     owned = {
         int(b)
-        for b in _tolist_timed(
-            meta.block_tables[row], f"ownership.block_tables.tolist"
-        )
+        for b in _tolist_timed(meta.block_tables[row], "ownership.block_tables.tolist")
     }
     slots = meta.slot_mapping if hi is None else meta.slot_mapping[lo:hi]
     for s in _tolist_timed(slots, "ownership.slot_mapping.tolist"):
@@ -797,9 +791,7 @@ def _slots_cover_span(
     block_table = meta.block_tables[row]
     for tok in range(span_start, span_end):
         block_idx = tok // block_size
-        block_id = _item_timed(
-            block_table[block_idx], "coverage_expected.item"
-        )
+        block_id = _item_timed(block_table[block_idx], "coverage_expected.item")
         expected[block_id * block_size + tok % block_size] += 1
     slots = meta.slot_mapping if hi is None else meta.slot_mapping[lo:hi]
     actual = Counter(

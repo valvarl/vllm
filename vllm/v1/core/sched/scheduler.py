@@ -668,7 +668,7 @@ class Scheduler(SchedulerInterface):
             # with the batch queue (async scheduling) the next schedule()
             # runs before the verdict, and rows scheduled beside the
             # pending plan would race the commit's num_computed_tokens
-            # restoration (double execution, mis-sequenced samples).
+            # restoration (double execution, out-of-order samples).
             # The verdict always arrives -- the repair step's output is
             # queued ahead of any later step, and a missing result is
             # synthesized as a failed verdict at that step's update.
@@ -684,18 +684,15 @@ class Scheduler(SchedulerInterface):
         # pending-plan drain freezes the whole engine.
         if request.status == RequestStatus.RUNNING:
             never_fits = (
-                plan.est_equivalent_tokens + plan.n_eff + draft_slots
-                > input_budget
+                plan.est_equivalent_tokens + plan.n_eff + draft_slots > input_budget
             )
         else:
             never_fits = (
-                max(plan.est_equivalent_tokens, plan.n_eff) + draft_slots
-                > input_budget
+                max(plan.est_equivalent_tokens, plan.n_eff) + draft_slots > input_budget
             )
         if (
             never_fits
-            or plan.est_equivalent_tokens
-            > self.scheduler_config.max_num_batched_tokens
+            or plan.est_equivalent_tokens > self.scheduler_config.max_num_batched_tokens
             or plan.n_eff > self.max_num_scheduled_tokens
         ):
             self._dissolve_recovery_plan(plan, "cannot fit any step budget")
@@ -845,10 +842,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = 0
                 req_index += 1
                 continue
-            if (
-                repair_pending
-                and request.request_id not in self.recovery_plans
-            ):
+            if repair_pending and request.request_id not in self.recovery_plans:
                 # The pending plan drains first; ordinary running work
                 # waits one step. The damaged request itself must fall
                 # through to the budget call below: freezing it here
@@ -917,10 +911,7 @@ class Scheduler(SchedulerInterface):
             # cap, or the later surcharge debit would not fit the budget.
             _repair_reserve = (
                 _pending_plan.est_equivalent_tokens
-                if (
-                    _pending_plan is not None
-                    and _pending_plan.state == "DETECTED"
-                )
+                if (_pending_plan is not None and _pending_plan.state == "DETECTED")
                 else 0
             )
             num_new_tokens = min(
@@ -1024,9 +1015,7 @@ class Scheduler(SchedulerInterface):
                     if new_blocks is not None:
                         # The request can be scheduled.
                         if delay_repair_txn:
-                            self._delayed_repair_txn_pubs.add(
-                                request.request_id
-                            )
+                            self._delayed_repair_txn_pubs.add(request.request_id)
                         break
 
                     if (
@@ -1183,10 +1172,7 @@ class Scheduler(SchedulerInterface):
                     # One repair per step.
                     skip_request(request_queue)
                     continue
-                if (
-                    repair_pending
-                    and request.request_id not in self.recovery_plans
-                ):
+                if repair_pending and request.request_id not in self.recovery_plans:
                     # The pending plan drains first.
                     skip_request(request_queue)
                     continue
@@ -2440,9 +2426,7 @@ class Scheduler(SchedulerInterface):
                     span=work.repair_span,
                     aborted=True,
                 )
-                repair_dispositions[req_id] = self._consume_repair_result(
-                    missing
-                )
+                repair_dispositions[req_id] = self._consume_repair_result(missing)
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
                 self._handle_failed_recving(kv_connector_output.failed_recving)
@@ -2476,9 +2460,7 @@ class Scheduler(SchedulerInterface):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 continue
-            self.kv_cache_manager.cache_blocks(
-                request, request.num_computed_tokens
-            )
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -3557,9 +3539,7 @@ class Scheduler(SchedulerInterface):
             # the chunk the completed forward wrote (the schedule-time
             # advance), so this mirrors the async recv precedent's
             # success arm.
-            self.kv_cache_manager.cache_blocks(
-                request, request.num_computed_tokens
-            )
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """KV Connector: update request state after async recv is finished.
@@ -3816,9 +3796,7 @@ class Scheduler(SchedulerInterface):
             report.restored_extent,
         )
 
-    def _handle_repair_reports(
-        self, reports: list[KVLoadFailureReport]
-    ) -> set[str]:
+    def _handle_repair_reports(self, reports: list[KVLoadFailureReport]) -> set[str]:
         """Consume structured load-failure reports under the repair policy.
 
         Two passes per request. The consensus pass groups the step's
@@ -3900,9 +3878,7 @@ class Scheduler(SchedulerInterface):
                 report.rollback_boundary,
                 report.token_span[1],
             )
-            write_set = self._repair_write_set_block_ids(
-                request, rollback, corrupt_end
-            )
+            write_set = self._repair_write_set_block_ids(request, rollback, corrupt_end)
             violating_block = self._write_set_shared_block(write_set)
             if violating_block is not None:
                 # Write-set fence: the repair execution writes the span's
@@ -4047,7 +4023,9 @@ class Scheduler(SchedulerInterface):
             or report.token_span[1] % bs
         ):
             return (
-                "not block-aligned (block_size=" + str(bs) + "): span="
+                "not block-aligned (block_size="
+                + str(bs)
+                + "): span="
                 + str(report.token_span)
                 + " rollback="
                 + str(report.rollback_boundary)
@@ -4183,9 +4161,7 @@ class Scheduler(SchedulerInterface):
             # -- and the resume recomputes the untrusted [span_end, C)
             # extent through the ordinary path.
             restored = (
-                plan.restored_extent
-                if plan.healthy_above_span
-                else plan.repair_span[1]
+                plan.restored_extent if plan.healthy_above_span else plan.repair_span[1]
             )
             # The result is untrusted input: an aborted verdict reaching
             # the commit arm or a negative layer count must never
@@ -4223,9 +4199,7 @@ class Scheduler(SchedulerInterface):
         the request truncates to the rollback boundary, and the ordinary
         recompute fallback owns it. The plan is already purged."""
         if plan.failed_block_ids:
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(
-                request.request_id
-            )
+            (req_block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
             try:
                 failed_idx = req_block_ids.index(plan.failed_block_ids[0])
                 blocks_to_evict = set(req_block_ids[failed_idx:])

@@ -62,8 +62,13 @@ def _aborted_repair_scenario():
     out2 = scheduler.schedule()
     assert plan.state == "ADMITTED"
     drive_repair_result(
-        scheduler, r1, out2, structural_check=False,
-        plan=plan, aborted=True, executed_layers=2,
+        scheduler,
+        r1,
+        out2,
+        structural_check=False,
+        plan=plan,
+        aborted=True,
+        executed_layers=2,
     )
     return scheduler, r1, block_ids, block_pool
 

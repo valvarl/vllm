@@ -102,9 +102,7 @@ def test_one_rank_reporting_alone_installs_plan():
     repair replays the span on EVERY rank, so a silent majority is not
     a divergence."""
     scheduler, r1, out1 = _sync_claim_scenario()
-    _deliver_reports(
-        scheduler, out1, [_structured_report(scheduler, r1)], reqs=[r1]
-    )
+    _deliver_reports(scheduler, out1, [_structured_report(scheduler, r1)], reqs=[r1])
     assert r1.request_id in scheduler.recovery_plans
 
 
@@ -116,8 +114,11 @@ def test_divergent_regions_reject_recovery_not_engine():
     scheduler, r1, out1 = _sync_claim_scenario()
     a = _structured_report(scheduler, r1)
     b = _structured_report(
-        scheduler, r1, failed_block_idx=97,
-        token_span=(97 * BS, 98 * BS), rollback_boundary=97 * BS,
+        scheduler,
+        r1,
+        failed_block_idx=97,
+        token_span=(97 * BS, 98 * BS),
+        rollback_boundary=97 * BS,
     )
     a.source_rank = 0
     b.source_rank = 1
@@ -203,13 +204,14 @@ def test_multiple_requests_independent_failures():
     divergent_pair = [
         _structured_report(scheduler, r2),
         _structured_report(
-            scheduler, r2, failed_block_idx=97,
-            token_span=(97 * BS, 98 * BS), rollback_boundary=97 * BS,
+            scheduler,
+            r2,
+            failed_block_idx=97,
+            token_span=(97 * BS, 98 * BS),
+            rollback_boundary=97 * BS,
         ),
     ]
-    _deliver_reports(
-        scheduler, out1, [good] + divergent_pair, reqs=[r1, r2]
-    )
+    _deliver_reports(scheduler, out1, [good] + divergent_pair, reqs=[r1, r2])
 
     assert set(scheduler.recovery_plans) == {r1.request_id}
     assert r1.num_computed_tokens == 96 * BS

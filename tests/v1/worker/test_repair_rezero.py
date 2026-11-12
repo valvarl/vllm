@@ -95,6 +95,7 @@ def test_clean_run_writes_layers_and_leaves_rest_untouched():
     at the sentinel."""
     works, tokens, positions, input_ids, meta = _multi_work_setup()
     model = _FakeModel(n_layers=4)
+
     # Make layer 0 write req-a's span block so the changed-rows half of
     # the control is real.
     class _WritingLayer(_FakeLayer):

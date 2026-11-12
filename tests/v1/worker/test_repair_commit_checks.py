@@ -22,7 +22,6 @@ from vllm.v1.core.sched.output import (
     RepairWork,
     SchedulerOutput,
 )
-from vllm.v1.outputs import RepairResultReport
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     _repair_sync_profile_enabled,
     _slots_cover_span,
@@ -64,7 +63,7 @@ def test_span_slot_coverage_detects_missing_and_foreign_slots():
 
 
 def test_span_slot_coverage_detects_duplicated_slot():
-    """A slot mapping with an EXTRA duplicated row (a mis-built metadata
+    """A slot mapping with an EXTRA duplicated row (a malformed metadata
     emitting one token twice) covers every expected slot exactly once
     plus the alias: the set comparison passes it, the multiset comparison
     must not."""
@@ -243,6 +242,7 @@ def test_layer_exception_contained_as_abort():
     works, tokens, positions, input_ids, meta = _multi_work_setup()
     sub = _sub_output(works, tokens)
     model = _FakeModel(n_layers=4)
+
     # Layer 1 raises for every caller; req-a (layer_end=1) never reaches
     # it, req-b (layer_end=2) hits it on its second layer.
     class _BoomLayer(_FakeLayer):
@@ -309,9 +309,7 @@ def _run_two_works(model, works, tokens, positions, input_ids, meta):
     with set_forward_context(
         {"model.layers.0": meta}, create_vllm_config(model="unsloth/Llama-3.2-1B")
     ):
-        return execute_repair_only(
-            model, sub, input_ids, positions, ["req-a", "req-b"]
-        )
+        return execute_repair_only(model, sub, input_ids, positions, ["req-a", "req-b"])
 
 
 def test_correlated_metadata_corruption_refused():
