@@ -275,7 +275,9 @@ class KVLoadAttestation:
     # complete set the transfer promised this rank, not only the
     # subset a GET touched.
     expected_objects: int
-    # Objects whose GET acknowledged bytes (includes the failed ones).
+    # Objects whose GET acknowledged bytes and did not fail; the
+    # failed objects are counted separately (loaded + failed must
+    # cover the complete expected set).
     loaded_objects: int
     # Objects whose GET failed; each must be covered by a failure
     # report for the same request and generation.
@@ -329,14 +331,18 @@ class KVLoadAttestation:
 
     def certifies_content(self) -> bool:
         """Whether this attestation independently proves content
-        identity for its FULL expected object set: a real certification
-        level ("sha256" or "content"), every expected object
-        certified, and zero failures."""
+        identity for every object it LOADED: a real certification
+        level ("sha256" or "content"), zero certification failures, and
+        every loaded object certified. The failed objects are excluded
+        by construction -- they are the failure report's regions (the
+        scheduler reconciles the counts), and those regions are what
+        the repair recomputes; everything ABOVE the repair span is
+        covered by the loaded-and-certified set."""
         if self.certification not in ("sha256", "content"):
             return False
         return (
             self.certification_failures == 0
-            and self.certified_objects == self.expected_objects
+            and self.certified_objects == self.loaded_objects
         )
 
 

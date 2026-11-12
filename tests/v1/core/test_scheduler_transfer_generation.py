@@ -66,6 +66,19 @@ def current_gen(scheduler, request):
     return scheduler._req_transfer_generation[request.request_id]
 
 
+def att_reported(scheduler, request, failed=1):
+    """The CONFORMING attestation for a report-bearing delivery: the
+    failed count reconciled with the report's region, everything that
+    loaded certified (the W2-ON fault shape)."""
+    return _terminal_attestation(
+        request.request_id,
+        loaded=192 - failed,
+        failed=failed,
+        certified=192 - failed,
+        generation=scheduler._req_transfer_generation.get(request.request_id),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Identity assignment and propagation.
 # ---------------------------------------------------------------------------
@@ -80,7 +93,7 @@ def test_generation_assigned_at_scheduling_and_echoed_in_plan():
     assert gen >= 1
 
     report = _structured_report(scheduler, r1)
-    attestation = _terminal_attestation(r1.request_id, generation=gen)
+    attestation = att_reported(scheduler, r1)
     deliver(scheduler, out1, [r1], reports=[report], attestations=[attestation])
 
     plan = scheduler.recovery_plans[r1.request_id]
@@ -151,7 +164,9 @@ def test_request_id_reuse_distinguishes_late_report_from_new_failure():
     assert new_gen > old_gen
 
     # The late report of the FIRST request's fault (old identity, old
-    # evidence) arrives: stale, dropped, must not authorize anything.
+    # evidence) arrives -- with the old attempt's OWN attestation
+    # (also old identity): the entire delivery is stale and must be
+    # absorbed without authorizing (or truncating) anything.
     (block_ids,) = scheduler.kv_cache_manager.get_block_ids(second.request_id)
     late = _structured_report(
         scheduler,
@@ -159,12 +174,19 @@ def test_request_id_reuse_distinguishes_late_report_from_new_failure():
         transfer_generation=old_gen,
         failed_block_ids=[block_ids[96]],
     )
+    stale_attestation = _terminal_attestation(
+        second.request_id,
+        loaded=191,
+        failed=1,
+        certified=191,
+        generation=old_gen,
+    )
     deliver(
         scheduler,
         out1,
         [second],
         reports=[late],
-        attestations=[_terminal_attestation(second.request_id, generation=new_gen)],
+        attestations=[stale_attestation],
     )
     assert scheduler.recovery_plans == {}
     # The new request was NOT truncated by the stale evidence.
@@ -178,7 +200,7 @@ def test_request_id_reuse_distinguishes_late_report_from_new_failure():
         out1,
         [second],
         reports=[fresh],
-        attestations=[_terminal_attestation(second.request_id, generation=new_gen)],
+        attestations=[att_reported(scheduler, second)],
     )
     plan = scheduler.recovery_plans[second.request_id]
     assert plan.transfer_generation == new_gen
@@ -196,7 +218,7 @@ def test_stale_report_cannot_dissolve_pending_plan():
         out1,
         [r1],
         reports=[report],
-        attestations=[_terminal_attestation(r1.request_id, generation=gen)],
+        attestations=[att_reported(scheduler, r1)],
     )
     plan = scheduler.recovery_plans[r1.request_id]
 
@@ -224,14 +246,14 @@ def test_late_duplicate_of_consumed_attempt_is_absorbed():
     plan, and the request is untouched (its outputs of the duplicate's
     step are ordinary, so nothing is skipped either)."""
     scheduler, r1, out1 = scenario()
-    gen = current_gen(scheduler, r1)
+    current_gen(scheduler, r1)
     report = _structured_report(scheduler, r1)
     deliver(
         scheduler,
         out1,
         [r1],
         reports=[report],
-        attestations=[_terminal_attestation(r1.request_id, generation=gen)],
+        attestations=[att_reported(scheduler, r1)],
     )
     plan = scheduler.recovery_plans[r1.request_id]
 
@@ -309,14 +331,14 @@ def test_report_without_identity_fails_closed():
     report with no transfer identity cannot be attributed to any
     attempt and fails the request closed (rollback 0)."""
     scheduler, r1, out1 = scenario()
-    gen = current_gen(scheduler, r1)
+    current_gen(scheduler, r1)
     report = _structured_report(scheduler, r1, transfer_generation=None)
     deliver(
         scheduler,
         out1,
         [r1],
         reports=[report],
-        attestations=[_terminal_attestation(r1.request_id, generation=gen)],
+        attestations=[att_reported(scheduler, r1)],
     )
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 0
@@ -333,7 +355,7 @@ def test_report_with_issued_only_identity_fails_closed():
         out1,
         [r1],
         reports=[report],
-        attestations=[_terminal_attestation(r1.request_id, generation=gen)],
+        attestations=[att_reported(scheduler, r1)],
     )
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 0
@@ -373,8 +395,15 @@ def test_stale_attestation_does_not_count_toward_completeness():
 
     report = _structured_report(scheduler, r1)
     report.source_rank = 0
-    rank0 = _terminal_attestation(r1.request_id, rank=0, generation=gen)
-    rank1 = _terminal_attestation(r1.request_id, rank=1, generation=gen - 1)
+    rank0 = att_reported(scheduler, r1)
+    rank1 = _terminal_attestation(
+        r1.request_id,
+        rank=1,
+        loaded=191,
+        failed=1,
+        certified=191,
+        generation=gen - 1,
+    )
     deliver(scheduler, out1, [r1], reports=[report], attestations=[rank0, rank1])
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 0

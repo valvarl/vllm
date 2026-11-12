@@ -4121,22 +4121,39 @@ class Scheduler(SchedulerInterface):
         # peer's clean-looking report arrives -- is exactly the
         # silent-corruption shape this contract exists to catch.
         reported_ranks = {r.source_rank for r in request_reports}
+        reports_by_rank: dict[int | None, list[KVLoadFailureReport]] = {}
+        for report in request_reports:
+            reports_by_rank.setdefault(report.source_rank, []).append(report)
         for attestation in request_attestations:
             if not attestation.terminal:
                 continue
-            if attestation.source_rank in reported_ranks:
+            rank_reports = reports_by_rank.get(attestation.source_rank, [])
+            if attestation.source_rank not in reported_ranks:
+                if attestation.failed_objects > 0:
+                    return (
+                        f"rank {attestation.source_rank} attests "
+                        f"{attestation.failed_objects} failed objects "
+                        "without its own failure report"
+                    )
+                if attestation.certification_failures > 0:
+                    return (
+                        f"rank {attestation.source_rank} attests "
+                        f"{attestation.certification_failures} certification "
+                        "failures without its own failure report"
+                    )
                 continue
-            if attestation.failed_objects > 0:
+            # The count reconciliation: a rank's attestation must
+            # account for exactly the failed regions its own reports
+            # name (v1: one region per report). An attestation that
+            # counts more failed objects than the reports describe
+            # leaves failures outside the reported span -- un-repaired
+            # holes the plan would never cover.
+            reported_failed = sum(len(r.failed_block_ids) for r in rank_reports)
+            if attestation.failed_objects != reported_failed:
                 return (
                     f"rank {attestation.source_rank} attests "
-                    f"{attestation.failed_objects} failed objects "
-                    "without its own failure report"
-                )
-            if attestation.certification_failures > 0:
-                return (
-                    f"rank {attestation.source_rank} attests "
-                    f"{attestation.certification_failures} certification "
-                    "failures without its own failure report"
+                    f"{attestation.failed_objects} failed objects but its "
+                    f"reports name {reported_failed} region(s)"
                 )
         return None
 

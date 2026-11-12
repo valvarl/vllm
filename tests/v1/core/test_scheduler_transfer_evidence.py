@@ -35,6 +35,8 @@ output aggregator produces -- and pin the contract:
   no plan, no rejection, the request proceeds.
 """
 
+import copy
+
 import pytest
 
 from tests.v1.core.test_scheduler_repair_budget import (
@@ -101,19 +103,34 @@ def deliver_evidence(scheduler, out, reqs, reports=(), attestations=()):
 
 
 def full_evidence(scheduler, request, *, report=None, tp_size=1, **att_overrides):
-    """The conforming shape: a well-formed report plus one terminal,
-    fully certified attestation per TP rank, all stamped with the
-    request's latest scheduled attempt identity."""
+    """The conforming shape: the production duplicate-fold -- every TP
+    rank reports the identical fault (the reports differ only in the
+    aggregator-stamped source_rank; the evidence-key fold absorbs
+    them) and every rank attests terminally, reconciled with its own
+    report (the failed region excluded from its loaded set; everything
+    that loaded is sha-certified)."""
     if report is None:
         report = _structured_report(scheduler, request)
     generation = scheduler._req_transfer_generation.get(request.request_id)
-    attestations = [
-        _terminal_attestation(
-            request.request_id, rank=r, generation=generation, **att_overrides
+    failed = len(report.failed_block_ids)
+    fields = dict(
+        loaded=192 - failed,
+        failed=failed,
+        certified=192 - failed,
+    )
+    fields.update(att_overrides)
+    reports = []
+    attestations = []
+    for r in range(tp_size):
+        rank_report = copy.deepcopy(report)
+        rank_report.source_rank = r
+        reports.append(rank_report)
+        attestations.append(
+            _terminal_attestation(
+                request.request_id, rank=r, generation=generation, **fields
+            )
         )
-        for r in range(tp_size)
-    ]
-    return report, attestations
+    return reports, attestations
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +143,8 @@ def test_complete_evidence_installs_plan_with_healthy_above_span():
     sha-certified completion; the failure report authorizes the plan and
     the report's above-span claim is honored globally."""
     scheduler, r1, out1 = sync_claim_scenario(tp_size=2)
-    report, attestations = full_evidence(scheduler, r1, tp_size=2)
-    deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=attestations)
+    reports, attestations = full_evidence(scheduler, r1, tp_size=2)
+    deliver_evidence(scheduler, out1, [r1], reports=reports, attestations=attestations)
 
     plan = scheduler.recovery_plans[r1.request_id]
     assert plan is not None
@@ -143,7 +160,7 @@ def test_silent_rank_rejects_recovery_with_full_recompute_floor():
     only by the reporting rank is not certified on the silent rank."""
     scheduler, r1, out1 = sync_claim_scenario(tp_size=2)
     report = _structured_report(scheduler, r1)
-    rank0 = att(scheduler, r1, rank=0)
+    rank0 = att(scheduler, r1, rank=0, loaded=191, failed=1, certified=191)
     deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=[rank0])
 
     assert scheduler.recovery_plans == {}
@@ -172,7 +189,7 @@ def test_nonterminal_attestation_counts_as_missing():
     report = _structured_report(scheduler, r1)
     # Rank 0 terminal, rank 1 in flight.
     attestations = [
-        att(scheduler, r1, rank=0),
+        att(scheduler, r1, rank=0, loaded=191, failed=1, certified=191),
         att(scheduler, r1, rank=1, terminal=False),
     ]
     deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=attestations)
@@ -184,8 +201,8 @@ def test_tp1_requires_exactly_one_attestation():
     """The gate counts distinct attesting ranks against the TP size: at
     TP=1 the single rank's own attestation completes the evidence."""
     scheduler, r1, out1 = sync_claim_scenario(tp_size=1)
-    report, attestations = full_evidence(scheduler, r1, tp_size=1)
-    deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=attestations)
+    reports, attestations = full_evidence(scheduler, r1, tp_size=1)
+    deliver_evidence(scheduler, out1, [r1], reports=reports, attestations=attestations)
     assert r1.request_id in scheduler.recovery_plans
 
 
@@ -229,13 +246,48 @@ def test_valid_failure_with_silent_corruption_on_peer_fails_closed():
     report = _structured_report(scheduler, r1)
     # The report is rank 0's evidence (aggregator-stamped).
     report.source_rank = 0
-    rank0 = att(scheduler, r1, rank=0)
+    rank0 = att(scheduler, r1, rank=0, loaded=191, failed=1, certified=191)
     rank1 = att(scheduler, r1, rank=1, certified=191, cert_failures=1)
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[rank0, rank1]
     )
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 0
+
+
+def test_failed_objects_beyond_reported_regions_fail_closed():
+    """The count reconciliation: a rank whose attestation counts MORE
+    failed objects than its reports describe leaves failures outside
+    the reported span -- holes no plan would cover. Fail closed."""
+    scheduler, r1, out1 = sync_claim_scenario()
+    report = _structured_report(scheduler, r1)
+    report.source_rank = 0
+    # The report names ONE region; the attestation counts TWO failed
+    # objects on the same rank.
+    attestation = att(scheduler, r1, loaded=190, failed=2, certified=190)
+    deliver_evidence(
+        scheduler, out1, [r1], reports=[report], attestations=[attestation]
+    )
+    assert scheduler.recovery_plans == {}
+    assert r1.num_computed_tokens == 0
+
+
+def test_certified_loaded_set_honors_above_span_with_in_span_fault():
+    """The W2-ON fault shape: the failed object sits INSIDE the repair
+    span (covered by the report) and every object that loaded is
+    sha-certified. The above-span claim is provable -- the predicate
+    certifies the LOADED set, not the expected set (the span's failed
+    object is recomputed, not trusted)."""
+    scheduler, r1, out1 = sync_claim_scenario()
+    report = _structured_report(scheduler, r1)
+    report.source_rank = 0
+    attestation = att(scheduler, r1, loaded=191, failed=1, certified=191)
+    deliver_evidence(
+        scheduler, out1, [r1], reports=[report], attestations=[attestation]
+    )
+    plan = scheduler.recovery_plans[r1.request_id]
+    assert plan is not None
+    assert plan.healthy_above_span is True
 
 
 def test_failed_objects_with_matching_report_is_consistent():
@@ -261,7 +313,9 @@ def test_certification_failure_with_matching_report_admits_plan_unhealthy():
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
     report.source_rank = 0
-    attestation = att(scheduler, r1, certified=191, cert_failures=1)
+    attestation = att(
+        scheduler, r1, loaded=191, failed=1, certified=190, cert_failures=1
+    )
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[attestation]
     )
@@ -276,7 +330,7 @@ def test_duplicate_identical_attestations_are_absorbed():
     rank are absorbed, not treated as divergence."""
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
-    attestation = att(scheduler, r1)
+    attestation = att(scheduler, r1, loaded=191, failed=1, certified=191)
     deliver_evidence(
         scheduler,
         out1,
@@ -313,7 +367,7 @@ def test_healthy_above_span_requires_every_ranks_certification():
     recomputed, never consumed as verified cache."""
     scheduler, r1, out1 = sync_claim_scenario(tp_size=2)
     report = _structured_report(scheduler, r1)
-    rank0 = att(scheduler, r1, rank=0)
+    rank0 = att(scheduler, r1, rank=0, loaded=191, failed=1, certified=191)
     rank1 = att(scheduler, r1, rank=1, certification="none", certified=0)
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[rank0, rank1]
@@ -330,7 +384,14 @@ def test_size_only_certification_is_not_content_verification():
     the above-span claim is refused."""
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
-    attestation = att(scheduler, r1, certification="size", certified=0)
+    attestation = att(
+        scheduler,
+        r1,
+        certification="size",
+        certified=0,
+        loaded=191,
+        failed=1,
+    )
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[attestation]
     )
@@ -346,7 +407,14 @@ def test_content_addressed_keys_honor_the_claim_under_store_trust():
     safety assumption, made explicit and enforceable."""
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
-    attestation = att(scheduler, r1, certification="content")
+    attestation = att(
+        scheduler,
+        r1,
+        certification="content",
+        loaded=191,
+        failed=1,
+        certified=191,
+    )
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[attestation]
     )
@@ -387,7 +455,7 @@ def test_rejected_claim_keeps_blocks_unpublished():
     block_pool = scheduler.kv_cache_manager.block_pool
 
     report = _structured_report(scheduler, r1)
-    rank0 = att(scheduler, r1, rank=0)
+    rank0 = att(scheduler, r1, rank=0, loaded=191, failed=1, certified=191)
     # TP=2, rank 1 silent.
     scheduler._evidence_tp_size = 2
     deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=[rank0])

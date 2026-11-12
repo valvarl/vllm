@@ -411,8 +411,10 @@ def _structured_report(scheduler, r1, failed_block_idx=96, **overrides):
         observed_failed_layers=[3],
         healthy_above_span=True,
         restored_extent=3072,
-        # The conforming shape stamps the report with its attempt's
+        # The conforming shape: the aggregator-stamped rank (the
+        # production evidence always carries it) and the attempt's
         # identity (the scheduler assigned it at load scheduling).
+        source_rank=0,
         transfer_generation=scheduler._req_transfer_generation.get(r1.request_id),
     )
     fields.update(overrides)
@@ -459,15 +461,21 @@ def _deliver_report(scheduler, r1, out, report, reqs=None, attestations=None):
     """Deliver a report through update_from_output with the CONFORMING
     evidence shape: a terminal attestation accompanies the report (the
     fixture scheduler is TP=1), both stamped with the request's latest
-    scheduled attempt identity, so the completeness and identity gates
-    see complete, current evidence. Tests exercising the incomplete-
-    or stale-evidence shapes pass their own (or no) attestations and
-    override the report's transfer_generation."""
+    scheduled attempt identity and RECONCILED with the report (the
+    attestation's failed count equals the report's failed regions;
+    everything that loaded is certified), so the completeness, identity,
+    and reconciliation gates see consistent evidence. Tests exercising
+    the incomplete- or stale-evidence shapes pass their own (or no)
+    attestations and override the report's transfer_generation."""
     output = create_model_runner_output(reqs=reqs or [r1], use_eos=False)
     if attestations is None:
+        failed = len(report.failed_block_ids)
         attestations = [
             _terminal_attestation(
                 r1.request_id,
+                loaded=192 - failed,
+                failed=failed,
+                certified=192 - failed,
                 generation=scheduler._req_transfer_generation.get(r1.request_id),
             )
         ]

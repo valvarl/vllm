@@ -48,13 +48,28 @@ def _deliver_reports(scheduler, out, reports, reqs, attestations=None):
 
     output = create_model_runner_output(reqs=reqs, use_eos=False)
     if attestations is None:
-        attestations = [
-            _terminal_attestation(
-                req_id,
-                generation=scheduler._req_transfer_generation.get(req_id),
+        # The conforming positive half, RECONCILED with the reports:
+        # one terminal attestation per request (the fixture scheduler
+        # is TP=1, so rank 0's own reports -- unstamped reports are the
+        # implicit rank-0 shape -- define its failed count; other ranks'
+        # duplicates are their own evidence), everything that loaded
+        # certified.
+        attestations = []
+        for req_id in {r.request_id for r in reports}:
+            failed = sum(
+                len(r.failed_block_ids)
+                for r in reports
+                if r.request_id == req_id and (r.source_rank or 0) == 0
             )
-            for req_id in {r.request_id for r in reports}
-        ]
+            attestations.append(
+                _terminal_attestation(
+                    req_id,
+                    loaded=192 - failed,
+                    failed=failed,
+                    certified=192 - failed,
+                    generation=scheduler._req_transfer_generation.get(req_id),
+                )
+            )
     output.kv_connector_output = KVConnectorOutput(
         load_failure_reports=reports,
         load_attestations=attestations,
