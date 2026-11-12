@@ -315,9 +315,19 @@ class KVLoadAttestation:
         """The structural invariants of a single attestation: a
         terminal attestation must account for its complete expected
         object set (loaded + failed == expected), its certified count
-        cannot exceed what it loaded, and a certification failure can
-        only appear alongside a certification capable of detecting it."""
-        if self.expected_objects < 0 or self.loaded_objects < 0:
+        cannot exceed what it loaded, no count may be negative, the
+        certification must be one of the enumerated levels, and a
+        certification failure can only appear alongside a certification
+        capable of detecting it."""
+        if (
+            self.expected_objects < 0
+            or self.loaded_objects < 0
+            or self.failed_objects < 0
+            or self.certified_objects < 0
+            or self.certification_failures < 0
+        ):
+            return False
+        if self.certification not in ("sha256", "content", "size", "none"):
             return False
         if self.terminal and (
             self.loaded_objects + self.failed_objects != self.expected_objects
@@ -337,8 +347,12 @@ class KVLoadAttestation:
         by construction -- they are the failure report's regions (the
         scheduler reconciles the counts), and those regions are what
         the repair recomputes; everything ABOVE the repair span is
-        covered by the loaded-and-certified set."""
+        covered by the loaded-and-certified set. A vacuous attestation
+        (no expected objects) proves nothing: a rank with a real
+        external claim holds at least one object."""
         if self.certification not in ("sha256", "content"):
+            return False
+        if self.expected_objects < 1:
             return False
         return (
             self.certification_failures == 0

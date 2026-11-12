@@ -248,6 +248,11 @@ class Scheduler(SchedulerInterface):
         # its latest scheduled attempt.
         self._next_transfer_generation = 0
         self._req_transfer_generation: dict[str, int] = {}
+        # Requests whose external transfer evidence failed closed at
+        # least once (reviewer B's F4): the connector is not re-consulted
+        # for them -- the retry is a local recompute, never an unbounded
+        # external re-attempt loop.
+        self._untrusted_external_reqs: set[str] = set()
         # request_id -> the (transfer_generation, evidence key) pairs
         # of every recovery authorization that reached a terminal
         # disposition (committed, aborted, dissolved): a late
@@ -279,6 +284,24 @@ class Scheduler(SchedulerInterface):
             kv_load_failure_policy = kv_transfer_config.kv_load_failure_policy
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
             self.repair_kv_load_failures = kv_load_failure_policy == "repair"
+            if self.repair_kv_load_failures and (
+                vllm_config.parallel_config.pipeline_parallel_size > 1
+            ):
+                # The v1 evidence contract is TP-scoped: the
+                # completeness gate demands terminal attestations from
+                # exactly the TP group's rank indices, but the output
+                # aggregator stamps source_rank over every gathered
+                # worker (tp*pp under PP>1) -- a count-satisfying set of
+                # the WRONG stage's workers would pass a weaker check
+                # while the shard-holding stage stays silent (reviewer
+                # B's F1). Fail fast at init instead of shipping a
+                # false-commit path; PP support needs the request's
+                # actual TP-group rank set derived in the executor.
+                raise RuntimeError(
+                    "kv_load_failure_policy='repair' requires "
+                    "pipeline_parallel_size=1 in v1 (the transfer-evidence "
+                    "completeness gate is TP-scoped)"
+                )
 
             # With overlapping batches (async scheduling or PP), a step may
             # still be writing a freed request's KV blocks. A consumer KV
@@ -777,8 +800,11 @@ class Scheduler(SchedulerInterface):
         """Drop a DETECTED plan and hand the request to the ordinary
         rollback-recompute path (num_computed_tokens already sits at the
         rollback boundary). The request keeps running; only the repair
-        attempt is abandoned."""
+        attempt is abandoned. The dissolved plan's evidence is recorded
+        as consumed (reviewer B's F3): a late re-delivery of it is
+        absorbed, never re-authorized on top of the fallback."""
         self.recovery_plans.pop(plan.request_id, None)
+        self._remember_consumed_evidence(plan)
         logger.warning(
             "Repair plan dissolved: req=%s plan_id=%d span=%s E=%d "
             "deferrals=%d (%s) -> the ordinary recompute path owns the "
@@ -1267,6 +1293,15 @@ class Scheduler(SchedulerInterface):
                             )
                         )
                         if request.skip_reading_prefix_cache:
+                            ext_tokens, load_kv_async = 0, False
+                        if request.request_id in self._untrusted_external_reqs:
+                            # The request's transfer evidence already
+                            # failed closed once (reviewer B's F4): a
+                            # connector that re-offers the same hit
+                            # would start an unbounded external
+                            # re-attempt loop. The external source is
+                            # untrusted for this request's lifetime:
+                            # the retry is a local recompute.
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
@@ -1998,8 +2033,12 @@ class Scheduler(SchedulerInterface):
         request.num_output_placeholders = 0
         request.num_preemptions += 1
         # The whole prompt is recomputed on re-admission: any pending
-        # hole-repair plan is void.
-        self.recovery_plans.pop(request.request_id, None)
+        # hole-repair plan is void (its evidence recorded as consumed,
+        # reviewer B's F3 -- a late re-delivery of the voided plan's
+        # evidence is absorbed, never re-authorized).
+        preempted_plan = self.recovery_plans.pop(request.request_id, None)
+        if preempted_plan is not None:
+            self._remember_consumed_evidence(preempted_plan)
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
@@ -3192,6 +3231,7 @@ class Scheduler(SchedulerInterface):
         # its generations -- the global counter never reuses one.
         self._req_transfer_generation.pop(request_id, None)
         self._consumed_report_evidence.pop(request_id, None)
+        self._untrusted_external_reqs.discard(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -3811,6 +3851,23 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = req_num_computed_tokens
 
                 affected_req_ids.add(request.request_id)
+                # The flat channel vs a pending plan (reviewer A's F5):
+                # this truncation may cut BELOW the plan's rollback and
+                # evict blocks inside the repair's write set, while the
+                # plan survives and its repair step would execute over
+                # the partially-evicted span. The flat channel's
+                # evidence and the structured evidence conflict:
+                # dissolve the plan to the recompute fallback (the
+                # flat truncation already owns the request).
+                flat_conflicted_plan = self.recovery_plans.pop(request.request_id, None)
+                if flat_conflicted_plan is not None:
+                    self._remember_consumed_evidence(flat_conflicted_plan)
+                    logger.warning(
+                        "Repair plan dissolved: req=%s conflicted with the "
+                        "flat invalid-blocks channel -> the flat recompute "
+                        "path owns the request",
+                        request.request_id,
+                    )
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
@@ -3912,9 +3969,13 @@ class Scheduler(SchedulerInterface):
                 reason,
                 skip_req_ids,
                 trusted_rollback=0,
+                mark_external_untrusted=True,
             )
         skip_req_ids |= self._check_transfer_attestations(
             reports_by_request, attest_by_request
+        )
+        skip_req_ids |= self._check_delivery_completeness(
+            attest_by_request, skip_req_ids
         )
         skip_req_ids |= self._handle_repair_reports(
             [
@@ -4005,7 +4066,34 @@ class Scheduler(SchedulerInterface):
         for attestation in attestations:
             req_id = attestation.request_id
             current = self._req_transfer_generation.get(req_id)
-            if current is None or attestation.transfer_generation != current:
+            if current is None:
+                # No scheduled attempt for this request: unattributable
+                # (a very late artifact, or a bogus connector). Dropped
+                # loudly, symmetric with the reports rule.
+                logger.error(
+                    "KV repair evidence dropped: attestation for req=%s "
+                    "names no scheduled external load attempt "
+                    "(generation=%r)",
+                    req_id,
+                    attestation.transfer_generation,
+                )
+                continue
+            if attestation.transfer_generation is None:
+                # The identity contract is mandatory under the repair
+                # policy: an attestation without it cannot be pinned to
+                # any attempt. Loud, symmetric with the reports rule
+                # (reviewer A's F8b).
+                violations.append(
+                    (
+                        req_id,
+                        "attestation without a transfer identity (the "
+                        "connector must implement the transfer-identity "
+                        "contract)",
+                        [],
+                    )
+                )
+                continue
+            if attestation.transfer_generation != current:
                 # Not evidence of the latest attempt: does not count
                 # toward completeness, and cannot complete a request
                 # whose reports ARE current.
@@ -4019,6 +4107,45 @@ class Scheduler(SchedulerInterface):
                 continue
             attest_by_request.setdefault(req_id, []).append(attestation)
         return reports_by_request, attest_by_request, violations
+
+    def _check_delivery_completeness(
+        self,
+        attest_by_request: dict[str, list[KVLoadAttestation]],
+        skip_req_ids: set[str],
+    ) -> set[str]:
+        """The completeness gate for deliveries with NO failure reports
+        (reviewer A's F1): the report path checks completeness before
+        authorizing a recovery, but an all-healthy delivery publishes
+        and consumes the claim through paths that never consult the
+        gate -- a silent rank's unverified shard would be published,
+        shared, and consumed as trusted. The attestation contract
+        makes every rank attest terminally no later than the load's
+        delivery step, so at the step a sync claim's publication is
+        due (it sits in _delayed_sync_claim_pubs) -- or the step an
+        attestation itself arrived -- the request's terminal set must
+        cover EVERY rank of the TP group. Incomplete evidence demotes
+        the whole external claim: the conservative recompute
+        fallback, and the publication gates stay closed."""
+        due: set[str] = set(attest_by_request)
+        due |= self._delayed_sync_claim_pubs
+        newly_failed: set[str] = set()
+        for req_id in due:
+            if req_id in skip_req_ids:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            gate = self._transfer_evidence_complete(attest_by_request.get(req_id, []))
+            if gate is not None:
+                self._reject_uninterpretable_reports(
+                    request,
+                    [],
+                    "incomplete transfer evidence (all-healthy delivery): " + gate,
+                    newly_failed,
+                    trusted_rollback=0,
+                    mark_external_untrusted=True,
+                )
+        return newly_failed
 
     def _check_transfer_attestations(
         self,
@@ -4050,6 +4177,7 @@ class Scheduler(SchedulerInterface):
                     reason,
                     skip_req_ids,
                     trusted_rollback=0,
+                    mark_external_untrusted=True,
                 )
         return skip_req_ids
 
@@ -4143,37 +4271,56 @@ class Scheduler(SchedulerInterface):
                     )
                 continue
             # The count reconciliation: a rank's attestation must
-            # account for exactly the failed regions its own reports
-            # name (v1: one region per report). An attestation that
-            # counts more failed objects than the reports describe
-            # leaves failures outside the reported span -- un-repaired
-            # holes the plan would never cover.
-            reported_failed = sum(len(r.failed_block_ids) for r in rank_reports)
+            # account for exactly the failed objects its own reports
+            # describe. The documented object unit is one cell per
+            # (rank, layer, block) -- the v1 full-attention pool has a
+            # single part per layer -- so the relation is failed
+            # blocks x failed layers per report (reviewer A's F4: a
+            # raw object-vs-block equality would fail-close every
+            # conforming connector whose failed block spans more than
+            # one layer). An attestation counting more leaves failures
+            # outside the reported span -- un-repaired holes the plan
+            # would never cover; counting fewer contradicts its own
+            # report.
+            reported_failed = sum(
+                len(r.failed_block_ids) * len(r.observed_failed_layers)
+                for r in rank_reports
+            )
             if attestation.failed_objects != reported_failed:
                 return (
                     f"rank {attestation.source_rank} attests "
                     f"{attestation.failed_objects} failed objects but its "
-                    f"reports name {reported_failed} region(s)"
+                    f"reports describe {reported_failed} object(s) "
+                    "(failed blocks x failed layers)"
                 )
         return None
 
     def _remember_consumed_evidence(self, plan: RecoveryPlan) -> None:
         """Record that this plan's report evidence reached a terminal
-        disposition (committed, aborted, or dissolved). A LATE
+        disposition (committed, aborted, or dissolved -- EVERY pop of
+        the plan without a verdict included, reviewer B's F3). A LATE
         re-delivery of the same evidence -- same transfer generation
         and same evidence key -- is a duplicate of an attempt whose
         outcome is already known: absorbed silently, never
         re-authorized. A genuine repeated failure carries a NEW
         generation (a new scheduled attempt) and is never absorbed by
-        this record."""
+        this record. Entries of OLDER generations are pruned on
+        insert: the partition drops older-generation reports before
+        they can reach the absorption check, so only the latest
+        generation's pairs are ever matchable (reviewer B's F5 -- no
+        fixed-count cap that a burst of same-generation entries can
+        evict)."""
         if plan.report_evidence is None:
             return
-        consumed = self._consumed_report_evidence.setdefault(plan.request_id, [])
+        consumed = [
+            (gen, key)
+            for gen, key in self._consumed_report_evidence.get(plan.request_id, [])
+            if gen == plan.transfer_generation
+        ]
         entry = (plan.transfer_generation, plan.report_evidence)
         if entry not in consumed:
             consumed.append(entry)
-        # Bound the memory: a request's retry count is small.
-        del consumed[:-8]
+        self._consumed_report_evidence[plan.request_id] = consumed
 
     def _transfer_evidence_complete(
         self, request_attestations: list[KVLoadAttestation]
@@ -4184,20 +4331,36 @@ class Scheduler(SchedulerInterface):
         complete. Reports are negative evidence -- a rank whose GET
         'succeeded' against corrupt or stale content reports nothing at
         all -- so only the positive attestations can prove that every
-        participating rank completed and verified its portion."""
+        participating rank completed and verified its portion.
+
+        The count is an EXACT SET over the TP group's rank indices
+        (reviewer B's F1): the aggregator stamps source_rank over the
+        gathered worker outputs, which under PP>1 covers the whole
+        world -- a count-based check is satisfiable by the wrong PP
+        stage's workers while the shard-holding stage stays silent.
+        Exact equality against set(range(tp_size)) makes that shape
+        fail closed; the repair policy is additionally rejected at
+        init when PP>1 (the v1 evidence contract is TP-scoped).
+        Vacuous attestations (expected_objects == 0) never count
+        (reviewer A's F6): a rank with a real external claim holds at
+        least one object."""
         terminal_ranks: set[int] = set()
         for attestation in request_attestations:
             if (
                 attestation.terminal
                 and attestation.well_formed()
                 and attestation.source_rank is not None
+                # A vacuous attestation never counts: a rank holding a
+                # real external claim has at least one expected object.
+                and attestation.expected_objects >= 1
             ):
                 terminal_ranks.add(attestation.source_rank)
-        if len(terminal_ranks) < self._evidence_tp_size:
+        expected = set(range(self._evidence_tp_size))
+        if terminal_ranks != expected:
             return (
                 f"incomplete transfer evidence: {len(terminal_ranks)} of "
                 f"{self._evidence_tp_size} TP ranks supplied a terminal "
-                "attestation for the request"
+                f"attestation for the request (ranks={sorted(terminal_ranks)})"
             )
         return None
 
@@ -4248,12 +4411,17 @@ class Scheduler(SchedulerInterface):
             if req_id in self.recovery_plans:
                 # A plan already owns this request. Reports matching the
                 # plan's evidence AND its transfer generation are
-                # same-step duplicates (absorbed); a report of an OLDER
-                # attempt is a late duplicate of the attempt the plan
-                # already consumed (absorbed -- it must not dissolve a
-                # plan built on newer evidence); anything else of the
-                # plan's own generation diverges from the evidence the
-                # plan was built on and dissolves it.
+                # same-step duplicates (absorbed); a report of a NEWER
+                # attempt (the only non-matching generation that can
+                # reach here -- the partition drops older ones) means a
+                # NEW scheduled attempt failed while this plan was
+                # pending: the plan is stale, it is DISSOLVED and the
+                # fresh evidence falls through to admission (reviewer
+                # A's F2: the old code absorbed the newer attempt's
+                # report and let the plan commit over its corruption);
+                # anything else of the plan's own generation diverges
+                # from the evidence the plan was built on and dissolves
+                # it.
                 plan = self.recovery_plans[req_id]
                 same_attempt = [
                     r
@@ -4261,27 +4429,42 @@ class Scheduler(SchedulerInterface):
                     if r.transfer_generation == plan.transfer_generation
                 ]
                 if len(same_attempt) < len(req_reports):
-                    logger.info(
-                        "KV repair evidence dropped: late report(s) of an "
-                        "older attempt absorbed against the pending plan "
-                        "for req=%s (plan generation=%r)",
+                    # After the identity partition every report here
+                    # carries the LATEST generation, so a report that
+                    # does not match the plan's generation is NEWER: a
+                    # new scheduled attempt failed while this plan was
+                    # pending. The plan is stale -- dissolve it and
+                    # fall through to the fresh-admission path with the
+                    # newer evidence (it owns the request now).
+                    logger.warning(
+                        "Repair plan dissolved: req=%s plan_id=%d was built "
+                        "on attempt %r but a NEWER attempt's failure "
+                        "evidence arrived -> the fresh evidence owns the "
+                        "request",
                         req_id,
+                        plan.plan_id,
                         plan.transfer_generation,
                     )
-                divergent = [
-                    r
-                    for r in same_attempt
-                    if self._report_evidence_key(r) != plan.report_evidence
-                ]
-                if divergent:
-                    self._reject_uninterpretable_reports(
-                        request,
-                        divergent,
-                        "divergent against the pending plan",
-                        skip_req_ids,
-                        trusted_rollback=plan.repair_span[0],
+                    self._dissolve_recovery_plan(
+                        plan, "newer attempt evidence superseded it"
                     )
-                continue
+                    # Fall through: req_reports (the newer evidence) is
+                    # admitted fresh below.
+                else:
+                    divergent = [
+                        r
+                        for r in same_attempt
+                        if self._report_evidence_key(r) != plan.report_evidence
+                    ]
+                    if divergent:
+                        self._reject_uninterpretable_reports(
+                            request,
+                            divergent,
+                            "divergent against the pending plan",
+                            skip_req_ids,
+                            trusted_rollback=plan.repair_span[0],
+                        )
+                    continue
             rejection = next(
                 (
                     reason
@@ -4344,7 +4527,12 @@ class Scheduler(SchedulerInterface):
             gate = self._transfer_evidence_complete(request_attestations)
             if gate is not None:
                 self._reject_uninterpretable_reports(
-                    request, req_reports, gate, skip_req_ids, trusted_rollback=0
+                    request,
+                    req_reports,
+                    gate,
+                    skip_req_ids,
+                    trusted_rollback=0,
+                    mark_external_untrusted=True,
                 )
                 continue
             rollback, corrupt_end = (
@@ -4554,6 +4742,7 @@ class Scheduler(SchedulerInterface):
         reason: str,
         skip_req_ids: set[str],
         trusted_rollback: int | None = None,
+        mark_external_untrusted: bool = False,
     ) -> None:
         """Request-scoped fail-closed fallback for uninterpretable report
         evidence (malformed, or divergent across ranks).
@@ -4598,6 +4787,12 @@ class Scheduler(SchedulerInterface):
         # for in-flight steps whose outputs are now suppressed.
         request.num_output_placeholders = 0
         skip_req_ids.add(request.request_id)
+        if mark_external_untrusted:
+            # The transfer-evidence contract itself failed: the external
+            # source is untrusted for this request's remaining lifetime
+            # (a re-offered hit would loop the re-attempt cycle --
+            # reviewer B's F4).
+            self._untrusted_external_reqs.add(request.request_id)
         logger.error(
             "KV repair refused: %s report evidence for req=%s -- failing "
             "closed to the recompute fallback (rollback=%d, evicted=%d). "
@@ -4723,7 +4918,15 @@ class Scheduler(SchedulerInterface):
         )
 
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
-        """Fail closed for layouts whose block IDs are not globally unique."""
+        """Fail closed for layouts whose block IDs are not globally unique.
+
+        Under the repair policy the flat request-level failure channel
+        gets the same conservative treatment as under recompute (the
+        pre-H13 code skipped BOTH the truncation and the arming, and
+        the promotion's success arm then published the failed claim at
+        its full placeholder extent -- reviewer A's F3): truncate to
+        zero and arm the promotion's failure arm. A recovery requires
+        structured evidence; the flat channel never authorizes one."""
         affected_req_ids: set[str] = set()
         for req_id in failed_req_ids:
             request = self.requests.get(req_id)
@@ -4732,10 +4935,14 @@ class Scheduler(SchedulerInterface):
                 and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
             ):
                 affected_req_ids.add(req_id)
-                if self.recompute_kv_load_failures:
+                if self.recompute_kv_load_failures or self.repair_kv_load_failures:
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(req_id)
-        return set() if self.recompute_kv_load_failures else affected_req_ids
+        return (
+            set()
+            if (self.recompute_kv_load_failures or self.repair_kv_load_failures)
+            else affected_req_ids
+        )
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]

@@ -181,29 +181,30 @@ def test_request_id_reuse_distinguishes_late_report_from_new_failure():
         certified=191,
         generation=old_gen,
     )
-    deliver(
-        scheduler,
-        out1,
-        [second],
-        reports=[late],
-        attestations=[stale_attestation],
-    )
-    assert scheduler.recovery_plans == {}
-    # The new request was NOT truncated by the stale evidence.
-    assert second.num_computed_tokens == 3328
-
-    # The new request's own failure (new identity) authorizes.
+    # The new attempt's own failure evidence arrives TOGETHER with
+    # the stale pair in the same step's delivery (the realistic
+    # shape): the fresh report + reconciled attestation authorize;
+    # the stale report and attestation are dropped by the identity
+    # partition.
     fresh = _structured_report(scheduler, second)
     assert fresh.transfer_generation == new_gen
     deliver(
         scheduler,
         out1,
         [second],
-        reports=[fresh],
-        attestations=[att_reported(scheduler, second)],
+        reports=[late, fresh],
+        attestations=[stale_attestation, att_reported(scheduler, second)],
     )
     plan = scheduler.recovery_plans[second.request_id]
+    assert plan is not None
     assert plan.transfer_generation == new_gen
+    assert second.num_computed_tokens == 96 * BS
+
+    # A later re-delivery of the stale report alone changes nothing: no
+    # dissolution, no truncation.
+    deliver(scheduler, out1, [second], reports=[late])
+    assert scheduler.recovery_plans[second.request_id] is plan
+    assert second.num_computed_tokens == 96 * BS
 
 
 def test_stale_report_cannot_dissolve_pending_plan():

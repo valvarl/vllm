@@ -129,6 +129,19 @@ class UniProcExecutor(Executor):
         if non_block and output.done():
             # Raise the exception in-line if the task failed.
             output.result()
+        if isinstance(output, ModelRunnerOutput):
+            # TP=1/uniproc: no output aggregator runs on this path, so
+            # the AUTHORITATIVE source_rank stamp (which the aggregator
+            # applies on gathered paths) is applied here: the single rank
+            # is index 0. Without it the transfer-evidence gates reject
+            # every unstamped report/attestation (conservative, but
+            # functionally broken for the repair policy).
+            kv_output = output.kv_connector_output
+            if kv_output is not None:
+                for report in kv_output.load_failure_reports or []:
+                    report.source_rank = 0
+                for attestation in kv_output.load_attestations or []:
+                    attestation.source_rank = 0
         return output
 
     def sample_tokens(  # type: ignore[override]
