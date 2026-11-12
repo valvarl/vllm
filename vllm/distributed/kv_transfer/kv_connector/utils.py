@@ -175,9 +175,13 @@ class KVOutputAggregator:
                 # consensus: identical duplicates of one fault arrive from
                 # every rank and are absorbed; the tag lets a divergent
                 # pair name the conflicting workers in its diagnostics.
-                # Connectors never set it -- only this aggregation does.
-                if report.source_rank is None:
-                    report.source_rank = rank
+                # The stamp is AUTHORITATIVE: the aggregator is the only
+                # component that knows which output came from which
+                # rank, so a connector-supplied value is always
+                # overwritten -- a connector must not be able to
+                # impersonate another rank in the divergence diagnostics
+                # (the final audit's FA-2).
+                report.source_rank = rank
             load_failure_reports.extend(kv_output.load_failure_reports or [])
             repair_results.extend(kv_output.repair_results or [])
 

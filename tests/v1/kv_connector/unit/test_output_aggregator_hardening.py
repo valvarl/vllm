@@ -50,17 +50,21 @@ def test_aggregator_stamps_source_rank_per_output_index():
     assert [r.source_rank for r in reports] == [0, 1]
 
 
-def test_aggregator_preserves_explicit_source_rank():
-    """The tag is aggregator-owned: a value already present (a
-    connector violating the contract, or a re-aggregated list) is never
-    overwritten."""
-    aggregator = KVOutputAggregator(expected_finished_count=1)
+def test_aggregator_overwrites_connector_supplied_source_rank():
+    """The tag is AUTHORITATIVELY aggregator-owned: a connector-supplied
+    value (a contract violation -- or an attempt to impersonate another
+    rank in the divergence diagnostics) is always overwritten with the
+    true originating rank (the final audit's FA-2)."""
+    aggregator = KVOutputAggregator(expected_finished_count=2)
     outputs = [
-        DummyModelRunnerOutput(load_failure_reports=[_report(source_rank=5)]),
+        DummyModelRunnerOutput(load_failure_reports=[_report(source_rank=1)]),
+        DummyModelRunnerOutput(load_failure_reports=[_report(source_rank=0)]),
     ]
     aggregated = aggregator.aggregate(outputs)
-    (report,) = aggregated.kv_connector_output.load_failure_reports
-    assert report.source_rank == 5
+    reports = aggregated.kv_connector_output.load_failure_reports
+    # Both reports came from their actual output indices, regardless of
+    # what the connector claimed.
+    assert [r.source_rank for r in reports] == [0, 1]
 
 
 def test_aggregator_stamps_rank_with_multiple_reports_and_requests():

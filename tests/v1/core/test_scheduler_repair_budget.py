@@ -1099,3 +1099,52 @@ def test_pending_plan_suppresses_step_outputs():
 
     assert r1.num_output_tokens == 0
     assert scheduler.recovery_plans[r1.request_id] is plan
+
+def test_stale_only_verdict_set_fails_safe():
+    """The final audit's FA-1: a verdict set that is ENTIRELY stale (no
+    echo matches the ADMITTED plan -- the shape H6's work-lookup
+    placeholder verdict produces, or a worker executing a stale
+    schedule) must not leave the plan ADMITTED indefinitely. The
+    missing-verdict synthesis fires for stale dispositions too: the plan
+    is consumed by the abort fallback and the request reschedules."""
+    scheduler = make_scheduler(
+        kv_load_failure_policy="repair", max_num_batched_tokens=8192
+    )
+    r1 = create_request(num_tokens=3328)
+    scheduler.add_request(r1)
+    admit_sync_external_hit(scheduler, r1, 3072)
+    out1 = scheduler.schedule()
+
+    _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1))
+    (block_ids,) = scheduler.kv_cache_manager.get_block_ids(r1.request_id)
+    plan = install_plan(scheduler, r1, E, failed_block_ids=[block_ids[96]])
+    out2 = scheduler.schedule()
+    assert plan.state == "ADMITTED"
+    assert out2.repair_works is not None
+
+    # A stale-only verdict set: the echo matches NOTHING admitted (the
+    # placeholder shape: plan_id -1, foreign span).
+    output = create_model_runner_output(reqs=[r1], use_eos=False)
+    output.sampled_token_ids = None
+    output.kv_connector_output = KVConnectorOutput(
+        repair_results=[
+            RepairResultReport(
+                request_id=r1.request_id,
+                plan_id=-1,
+                epoch=-1,
+                structural_check=True,
+                executed_layers=4,
+                span=(-1, -1),
+                aborted=False,
+            )
+        ]
+    )
+    scheduler.update_from_output(out2, output)
+
+    # The plan is CONSUMED by the synthesized failed verdict (not left
+    # ADMITTED forever), the request truncates to the rollback boundary,
+    # and the ordinary reschedule owns it.
+    assert scheduler.recovery_plans == {}
+    assert r1.num_computed_tokens == 96 * BS
+    out3 = scheduler.schedule()
+    assert out3.num_scheduled_tokens[r1.request_id] == 3328 - 96 * BS

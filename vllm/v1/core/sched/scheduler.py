@@ -2394,25 +2394,31 @@ class Scheduler(SchedulerInterface):
             )
         if kv_connector_output and kv_connector_output.repair_results:
             # The repair step's verdicts, one per admitted work item. TP
-            # aggregation may repeat a request's verdict across ranks; the
-            # duplicate is rejected as stale by the identity machinery and
-            # the dispositions keep the first verdict.
+            # aggregation may repeat a request's verdict across ranks;
+            # duplicates are rejected as stale by the identity machinery.
+            # The disposition keeps the first verdict that CONSUMED the
+            # plan (committed/aborted); a stale echo never overrides a
+            # consuming outcome, and a consuming outcome replaces an
+            # earlier stale one (the stale verdict consumed nothing).
             for result in kv_connector_output.repair_results:
-                if result.request_id in repair_dispositions:
-                    self._consume_repair_result(result)
-                else:
-                    repair_dispositions[result.request_id] = (
-                        self._consume_repair_result(result)
-                    )
+                disposition = self._consume_repair_result(result)
+                if result.request_id not in repair_dispositions or (
+                    repair_dispositions[result.request_id] == "stale"
+                    and disposition != "stale"
+                ):
+                    repair_dispositions[result.request_id] = disposition
         if scheduler_output.repair_works:
             # Every work admitted this step must produce its verdict at
-            # THIS update: a missing result would leave the plan ADMITTED
-            # indefinitely (the request stuck above the rollback floor,
-            # the span's blocks held). Fail safe: synthesize the missing
-            # verdict as a failed result -- the abort fallback, never a
-            # silent retry loop.
+            # THIS update: a missing OR ENTIRELY STALE result set would
+            # leave the plan ADMITTED indefinitely (the request stuck
+            # above the rollback floor, the span's blocks held) -- a
+            # stale echo does not consume the plan, so it counts as no
+            # verdict (the final audit's FA-1: the work-lookup
+            # placeholder verdict of H6 is exactly this shape). Fail
+            # safe: synthesize the missing verdict as a failed result --
+            # the abort fallback, never a silent retry loop.
             for req_id, work in scheduler_output.repair_works.items():
-                if req_id in repair_dispositions:
+                if repair_dispositions.get(req_id) not in (None, "stale"):
                     continue
                 plan = self.recovery_plans.get(req_id)
                 if plan is None or plan.state != "ADMITTED":

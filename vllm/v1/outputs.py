@@ -229,11 +229,12 @@ class KVLoadFailureReport:
     # The pre-failure external computed count C: the restoration target
     # at the repair commit.
     restored_extent: int
-    # Diagnostic only (set by the TP output aggregator, never by the
-    # connector): the index of the reporting worker in the gathered
-    # per-rank outputs. Two reports of one fault from different ranks
-    # are identical duplicates that differ only in this tag; the
-    # scheduler's evidence comparison excludes it.
+    # Diagnostic only (AUTHORITATIVELY set by the TP output
+    # aggregator; a connector-supplied value is overwritten): the index
+    # of the reporting worker in the gathered per-rank outputs. Two
+    # reports of one fault from different ranks are identical
+    # duplicates that differ only in this tag; the scheduler's evidence
+    # comparison excludes it.
     source_rank: int | None = None
 
 

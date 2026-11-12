@@ -28,7 +28,10 @@ These tests run the REAL collective over gloo in spawned processes
 
 NPU note: the production code pins the summary tensor to NPU when
 torch.npu.is_available(); this CI matrix runs gloo/CPU, so the workers
-force the CPU pinning path. The NPU/hccn transport keeps its own
+force the CPU pinning path (guarded by hasattr so the suite itself has
+no torch_npu dependency -- the final audit's FA-3). The NPU/HCCL
+transport has its own device validation (see the audit's
+device_validation/). The NPU/hccn transport keeps its own
 end-to-end validation (the RFC evidence base); a dedicated NPU
 regression for the consensus belongs with the device CI.
 """
@@ -142,8 +145,10 @@ def _consensus_worker(rank, world_size, port, result_queue):
     )
     # Force the CPU summary path for the gloo matrix (see module
     # docstring) and restore it afterwards.
-    npu_available = torch.npu.is_available
-    torch.npu.is_available = lambda: False
+    _had_npu = hasattr(torch, "npu")
+    if _had_npu:
+        _npu_available = torch.npu.is_available
+        torch.npu.is_available = lambda: False
     try:
         from vllm.v1.worker.kv_connector_model_runner_mixin import (
             _ranks_repair_agree,
@@ -157,7 +162,8 @@ def _consensus_worker(rank, world_size, port, result_queue):
     except BaseException as exc:  # noqa: BLE001 - recorded for the parent
         result_queue.put((rank, f"{type(exc).__name__}: {exc}", None))
     finally:
-        torch.npu.is_available = npu_available
+        if _had_npu:
+            torch.npu.is_available = _npu_available
         dist.destroy_process_group()
 
 
@@ -181,8 +187,10 @@ def _skip_worker(rank, world_size, port, result_queue):
         world_size=world_size,
         timeout=timedelta(seconds=_PG_TIMEOUT_S),
     )
-    npu_available = torch.npu.is_available
-    torch.npu.is_available = lambda: False
+    _had_npu = hasattr(torch, "npu")
+    if _had_npu:
+        _npu_available = torch.npu.is_available
+        torch.npu.is_available = lambda: False
     try:
         from vllm.v1.worker.kv_connector_model_runner_mixin import (
             _ranks_repair_agree,
@@ -200,7 +208,8 @@ def _skip_worker(rank, world_size, port, result_queue):
         except BaseException as exc:  # noqa: BLE001
             result_queue.put((rank, None, f"raised:{type(exc).__name__}"))
     finally:
-        torch.npu.is_available = npu_available
+        if _had_npu:
+            torch.npu.is_available = _npu_available
         try:
             dist.destroy_process_group()
         except Exception:
