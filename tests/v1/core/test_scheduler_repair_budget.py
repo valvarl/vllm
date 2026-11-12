@@ -262,13 +262,20 @@ def test_report_arm_installs_plan_and_skips_detection_output():
         observed_failed_layers=[3],
         healthy_above_span=True,
         restored_extent=3072,
+        transfer_generation=scheduler._req_transfer_generation[r1.request_id],
     )
     output = create_model_runner_output(reqs=[r1], use_eos=False)
     output.kv_connector_output = KVConnectorOutput(
         load_failure_reports=[report],
         # The conforming positive half of the evidence: the reporting
-        # rank's terminal, fully certified attestation (TP=1 fixture).
-        load_attestations=[_terminal_attestation(r1.request_id)],
+        # rank's terminal, fully certified attestation (TP=1 fixture),
+        # stamped with the attempt's identity.
+        load_attestations=[
+            _terminal_attestation(
+                r1.request_id,
+                generation=scheduler._req_transfer_generation.get(r1.request_id),
+            )
+        ],
     )
     n_output_tokens_before = len(r1.output_token_ids)
     scheduler.update_from_output(out1, output)
@@ -404,6 +411,9 @@ def _structured_report(scheduler, r1, failed_block_idx=96, **overrides):
         observed_failed_layers=[3],
         healthy_above_span=True,
         restored_extent=3072,
+        # The conforming shape stamps the report with its attempt's
+        # identity (the scheduler assigned it at load scheduling).
+        transfer_generation=scheduler._req_transfer_generation.get(r1.request_id),
     )
     fields.update(overrides)
     return KVLoadFailureReport(**fields)
@@ -420,11 +430,15 @@ def _terminal_attestation(
     certified=192,
     cert_failures=0,
     terminal=True,
+    generation=None,
     **overrides,
 ):
     """A conforming per-rank attestation: terminal, accounting for the
-    complete expected object set, with full SHA certification. 192
-    objects = the fixture's 3072-token external claim at BS=16."""
+    complete expected object set, with full SHA certification and its
+    attempt's transfer identity. 192 objects = the fixture's
+    3072-token external claim at BS=16. The generation defaults to
+    None; callers with scheduler access stamp it (as _deliver_report
+    does) or pass it explicitly."""
     fields = dict(
         request_id=request_id,
         expected_objects=expected,
@@ -434,6 +448,7 @@ def _terminal_attestation(
         certified_objects=certified,
         certification_failures=cert_failures,
         terminal=terminal,
+        transfer_generation=generation,
         source_rank=rank,
     )
     fields.update(overrides)
@@ -443,12 +458,19 @@ def _terminal_attestation(
 def _deliver_report(scheduler, r1, out, report, reqs=None, attestations=None):
     """Deliver a report through update_from_output with the CONFORMING
     evidence shape: a terminal attestation accompanies the report (the
-    fixture scheduler is TP=1), so the completeness gate sees complete
-    evidence. Tests exercising the incomplete-evidence shapes pass
-    their own (or no) attestations."""
+    fixture scheduler is TP=1), both stamped with the request's latest
+    scheduled attempt identity, so the completeness and identity gates
+    see complete, current evidence. Tests exercising the incomplete-
+    or stale-evidence shapes pass their own (or no) attestations and
+    override the report's transfer_generation."""
     output = create_model_runner_output(reqs=reqs or [r1], use_eos=False)
     if attestations is None:
-        attestations = [_terminal_attestation(r1.request_id)]
+        attestations = [
+            _terminal_attestation(
+                r1.request_id,
+                generation=scheduler._req_transfer_generation.get(r1.request_id),
+            )
+        ]
     output.kv_connector_output = KVConnectorOutput(
         load_failure_reports=[report],
         load_attestations=attestations,
@@ -617,12 +639,16 @@ def test_delayed_publication_default_policy_preserves_admission_publication():
     assert block_pool.blocks[block_ids[96]].block_hash is not None
 
 
-def test_fence_still_rejects_locally_published_span_block():
-    """The write-set fence stays fail-closed for genuinely published
-    blocks: a span block published through the ordinary LOCAL path (not
-    the delayed external claim) still refuses the repair loudly -- the
-    delayed publication narrows the fence's trigger surface, it does not
-    remove the fence."""
+def test_report_for_claimless_request_dropped_not_fenced():
+    """The identity gate precedes the fences: a connector reporting a
+    load failure for a request that never had an external load attempt
+    (no transfer identity) is contract-bogus. The report is dropped --
+    loudly -- and the request is untouched: no plan, no truncation, and
+    its locally published blocks stay published (there is no external
+    data to distrust). (The pre-identity version of this test drove
+    the same synthetic report into the write-set fence; under the
+    transfer-identity contract the drop is the correct, earlier,
+    fail-safe.)"""
     scheduler = make_scheduler(kv_load_failure_policy="repair")
     r1 = create_request(num_tokens=3328, common_prefix_len=3072)
     scheduler.add_request(r1)
@@ -634,11 +660,49 @@ def test_fence_still_rejects_locally_published_span_block():
     (block_ids,) = scheduler.kv_cache_manager.get_block_ids(r1.request_id)
     block_pool = scheduler.kv_cache_manager.block_pool
     assert block_pool.blocks[block_ids[96]].block_hash is not None
+    assert r1.request_id not in scheduler._req_transfer_generation
+
+    _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1))
+
+    assert scheduler.recovery_plans == {}
+    # Untouched: the request keeps its computed state and its
+    # publications.
+    assert r1.num_computed_tokens == 3328
+    assert block_pool.blocks[block_ids[96]].block_hash is not None
+
+
+def test_fence_rejects_repair_into_published_span_block():
+    """The write-set fence stays fail-closed for genuinely published
+    blocks: a request with a REAL external claim (a transfer identity)
+    whose reported span block has been published through any path --
+    here the ordinary publication of the request's verified prefix
+    (kv_cache_manager.cache_blocks, the same call the delayed-claim
+    publisher uses) -- refuses the repair loudly. The delayed
+    publication narrows the fence's trigger surface for the request's
+    OWN claim; it does not remove the fence."""
+    scheduler = make_scheduler(kv_load_failure_policy="repair")
+    r1 = create_request(num_tokens=3328)
+    scheduler.add_request(r1)
+    admit_sync_external_hit(scheduler, r1, 3072)
+
+    out1 = scheduler.schedule()
+    (block_ids,) = scheduler.kv_cache_manager.get_block_ids(r1.request_id)
+    block_pool = scheduler.kv_cache_manager.block_pool
+    assert r1.request_id in scheduler._req_transfer_generation
+    # The claim itself is unpublished (the delayed publication).
+    assert block_pool.blocks[block_ids[96]].block_hash is None
+
+    # Any other publication path (a verified prefix of the same request,
+    # another request's cached blocks) publishes the span block.
+    scheduler.kv_cache_manager.cache_blocks(r1, 97 * BS)
+    assert block_pool.blocks[block_ids[96]].block_hash is not None
 
     _deliver_report(scheduler, r1, out1, _structured_report(scheduler, r1))
 
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 96 * BS
+    # Everything from the boundary downstream is evicted: no future
+    # request matches the untrusted span.
     for bid in block_ids[96:]:
         assert block_pool.blocks[bid].block_hash is None
 

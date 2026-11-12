@@ -128,6 +128,13 @@ class RecoveryPlan:
     # (Scheduler._report_evidence_key): the duplicate-absorption key for
     # same-step re-deliveries of the same fault across TP ranks.
     report_evidence: tuple | None = None
+    # The identity of the transfer attempt whose failure built this
+    # plan (the generation the admitting report echoed). Reports
+    # arriving for a pending plan must match BOTH the evidence key and
+    # this generation: a stale-generation report against a pending
+    # plan is a late duplicate of the attempt the plan already
+    # consumed (absorbed), never fresh divergence evidence.
+    transfer_generation: int | None = None
     # The execution epoch: the scheduler step at which the plan was
     # admitted. A result echoing a different epoch is stale (the
     # overlapping-step rejection).
@@ -232,6 +239,23 @@ class Scheduler(SchedulerInterface):
         # nothing'. With PP>1 the repair policy is TP-scoped:
         # attestations are required from the TP group's ranks only.
         self._evidence_tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # Transfer identity (the report/attestation generation): a
+        # globally monotonic counter assigned at the moment an external
+        # load attempt is SCHEDULED -- early enough to accompany the
+        # actual transfer and all its resulting evidence. Never reused,
+        # including across request-ID reuse, so a late report cannot
+        # alias onto a later attempt. request_id -> the generation of
+        # its latest scheduled attempt.
+        self._next_transfer_generation = 0
+        self._req_transfer_generation: dict[str, int] = {}
+        # request_id -> the (transfer_generation, evidence key) pairs
+        # of every recovery authorization that reached a terminal
+        # disposition (committed, aborted, dissolved): a late
+        # re-delivery of the SAME attempt's SAME evidence is a
+        # duplicate whose outcome is already known and is absorbed --
+        # while a genuine repeated failure carries a NEW generation (a
+        # new scheduled attempt) and is honored.
+        self._consumed_report_evidence: dict[str, list[tuple[int | None, tuple]]] = {}
         # Transactional publication: request ids whose repair-step
         # admissions were left unpublished at allocate_slots; they publish
         # ONLY on the step's accepted verdict, never on abort/missing/stale.
@@ -1573,6 +1597,21 @@ class Scheduler(SchedulerInterface):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
+                    if num_external_computed_tokens > 0:
+                        # A new external load attempt is initiated:
+                        # assign its identity HERE, at transfer
+                        # initiation, so every report and attestation
+                        # the attempt produces echoes an identity the
+                        # scheduler can attribute to this attempt (and
+                        # a late report of a consumed attempt is
+                        # distinguishable from a new attempt's failure).
+                        self._next_transfer_generation += 1
+                        self._req_transfer_generation[request_id] = (
+                            self._next_transfer_generation
+                        )
+                        self.connector.note_transfer_attempt(
+                            request, self._next_transfer_generation
+                        )
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
@@ -3148,6 +3187,11 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.recovery_plans.pop(request_id, None)
+        # The transfer-identity bookkeeping dies with the request: a
+        # later request reusing the ID cannot inherit (or collide with)
+        # its generations -- the global counter never reuses one.
+        self._req_transfer_generation.pop(request_id, None)
+        self._consumed_report_evidence.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -3845,19 +3889,136 @@ class Scheduler(SchedulerInterface):
                 f"kv_load_failure_policy={policy!r}; the repair policy "
                 "is required to consume transfer evidence."
             )
-        reports_by_request: dict[str, list[KVLoadFailureReport]] = {}
-        for report in reports:
-            reports_by_request.setdefault(report.request_id, []).append(report)
-        attest_by_request: dict[str, list[KVLoadAttestation]] = {}
-        for attestation in attestations:
-            attest_by_request.setdefault(attestation.request_id, []).append(attestation)
-        skip_req_ids = self._check_transfer_attestations(
+        # The identity pass: partition the step's evidence by transfer
+        # generation. Only evidence of the request's LATEST scheduled
+        # attempt is current; anything else is a late artifact of an
+        # older attempt (dropped -- it can neither authorize nor
+        # dissolve anything) or a contract violation (no identity, or
+        # an identity the scheduler never issued) that fails the
+        # request closed.
+        (
+            reports_by_request,
+            attest_by_request,
+            violations,
+        ) = self._partition_transfer_evidence(reports, attestations)
+        skip_req_ids: set[str] = set()
+        for req_id, reason, request_reports in violations:
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            self._reject_uninterpretable_reports(
+                request,
+                request_reports,
+                reason,
+                skip_req_ids,
+                trusted_rollback=0,
+            )
+        skip_req_ids |= self._check_transfer_attestations(
             reports_by_request, attest_by_request
         )
         skip_req_ids |= self._handle_repair_reports(
-            reports, attest_by_request, evidence_failed=skip_req_ids
+            [
+                report
+                for request_reports in reports_by_request.values()
+                for report in request_reports
+            ],
+            attest_by_request,
+            evidence_failed=skip_req_ids,
         )
         return skip_req_ids
+
+    def _partition_transfer_evidence(
+        self,
+        reports: list[KVLoadFailureReport],
+        attestations: list[KVLoadAttestation],
+    ) -> tuple[
+        dict[str, list[KVLoadFailureReport]],
+        dict[str, list[KVLoadAttestation]],
+        list[tuple[str, str, list[KVLoadFailureReport]]],
+    ]:
+        """Attribute the step's evidence to transfer attempts by
+        generation.
+
+        Returns (current reports by request, current attestations by
+        request, per-request identity violations). Current means: the
+        evidence's echoed generation equals the request's latest
+        SCHEDULED attempt generation. A report whose generation is
+        older is a late duplicate of a consumed attempt -- dropped,
+        never able to authorize or dissolve anything, so a genuine new
+        attempt's failure is not discarded as a duplicate either (its
+        report carries the new attempt's generation). A report with
+        no identity, or one naming a generation the scheduler never
+        issued, is a contract violation collected for the caller to
+        fail closed. Attestations are informational: non-current ones
+        simply do not count toward the completeness gate.
+        """
+        reports_by_request: dict[str, list[KVLoadFailureReport]] = {}
+        attest_by_request: dict[str, list[KVLoadAttestation]] = {}
+        violations: list[tuple[str, str, list[KVLoadFailureReport]]] = []
+        for report in reports:
+            req_id = report.request_id
+            current = self._req_transfer_generation.get(req_id)
+            if current is None:
+                # No scheduled external load attempt for this request:
+                # the report is unattributable (a very late artifact
+                # of a finished request, or a bogus connector). The
+                # request holds no external data to distrust; drop.
+                logger.error(
+                    "KV repair evidence dropped: report for req=%s names "
+                    "no scheduled external load attempt (generation=%r)",
+                    req_id,
+                    report.transfer_generation,
+                )
+                continue
+            if report.transfer_generation is None:
+                violations.append(
+                    (
+                        req_id,
+                        "report without a transfer identity (the connector "
+                        "must implement the transfer-identity contract)",
+                        [report],
+                    )
+                )
+                continue
+            if report.transfer_generation > current:
+                violations.append(
+                    (
+                        req_id,
+                        "report names transfer generation "
+                        f"{report.transfer_generation} but the latest "
+                        f"scheduled attempt is {current} (an identity the "
+                        "scheduler never issued)",
+                        [report],
+                    )
+                )
+                continue
+            if report.transfer_generation < current:
+                logger.info(
+                    "KV repair evidence dropped: late report of the "
+                    "consumed attempt %d for req=%s (latest attempt is %d)",
+                    report.transfer_generation,
+                    req_id,
+                    current,
+                )
+                continue
+            reports_by_request.setdefault(req_id, []).append(report)
+        for attestation in attestations:
+            req_id = attestation.request_id
+            current = self._req_transfer_generation.get(req_id)
+            if current is None or attestation.transfer_generation != current:
+                # Not evidence of the latest attempt: does not count
+                # toward completeness, and cannot complete a request
+                # whose reports ARE current.
+                logger.debug(
+                    "Transfer attestation for req=%s does not match the "
+                    "latest attempt (generation=%r, latest=%r): not counted",
+                    req_id,
+                    attestation.transfer_generation,
+                    current,
+                )
+                continue
+            attest_by_request.setdefault(req_id, []).append(attestation)
+        return reports_by_request, attest_by_request, violations
 
     def _check_transfer_attestations(
         self,
@@ -3979,6 +4140,24 @@ class Scheduler(SchedulerInterface):
                 )
         return None
 
+    def _remember_consumed_evidence(self, plan: RecoveryPlan) -> None:
+        """Record that this plan's report evidence reached a terminal
+        disposition (committed, aborted, or dissolved). A LATE
+        re-delivery of the same evidence -- same transfer generation
+        and same evidence key -- is a duplicate of an attempt whose
+        outcome is already known: absorbed silently, never
+        re-authorized. A genuine repeated failure carries a NEW
+        generation (a new scheduled attempt) and is never absorbed by
+        this record."""
+        if plan.report_evidence is None:
+            return
+        consumed = self._consumed_report_evidence.setdefault(plan.request_id, [])
+        entry = (plan.transfer_generation, plan.report_evidence)
+        if entry not in consumed:
+            consumed.append(entry)
+        # Bound the memory: a request's retry count is small.
+        del consumed[:-8]
+
     def _transfer_evidence_complete(
         self, request_attestations: list[KVLoadAttestation]
     ) -> str | None:
@@ -4051,13 +4230,30 @@ class Scheduler(SchedulerInterface):
                 continue
             if req_id in self.recovery_plans:
                 # A plan already owns this request. Reports matching the
-                # plan's evidence are same-step duplicates (absorbed);
-                # anything else diverges from the evidence the plan was
-                # built on and dissolves it.
+                # plan's evidence AND its transfer generation are
+                # same-step duplicates (absorbed); a report of an OLDER
+                # attempt is a late duplicate of the attempt the plan
+                # already consumed (absorbed -- it must not dissolve a
+                # plan built on newer evidence); anything else of the
+                # plan's own generation diverges from the evidence the
+                # plan was built on and dissolves it.
                 plan = self.recovery_plans[req_id]
-                divergent = [
+                same_attempt = [
                     r
                     for r in req_reports
+                    if r.transfer_generation == plan.transfer_generation
+                ]
+                if len(same_attempt) < len(req_reports):
+                    logger.info(
+                        "KV repair evidence dropped: late report(s) of an "
+                        "older attempt absorbed against the pending plan "
+                        "for req=%s (plan generation=%r)",
+                        req_id,
+                        plan.transfer_generation,
+                    )
+                divergent = [
+                    r
+                    for r in same_attempt
                     if self._report_evidence_key(r) != plan.report_evidence
                 ]
                 if divergent:
@@ -4096,6 +4292,24 @@ class Scheduler(SchedulerInterface):
                 continue
             report = unique[0]
             request = self.requests[report.request_id]
+            # The consumed-evidence absorption: this exact (attempt,
+            # evidence) pair already reached a terminal disposition
+            # (committed, aborted, or dissolved) -- a late
+            # re-delivery is a duplicate of an outcome already known,
+            # absorbed without re-authorization and without touching
+            # the request (its outputs of THIS step are ordinary: the
+            # fault was detected in an earlier step).
+            if (
+                report.transfer_generation,
+                self._report_evidence_key(report),
+            ) in self._consumed_report_evidence.get(req_id, []):
+                logger.info(
+                    "KV repair evidence absorbed: late duplicate of the "
+                    "consumed attempt %d for req=%s",
+                    report.transfer_generation,
+                    req_id,
+                )
+                continue
             # The completeness gate: failure reports are negative
             # evidence -- a rank whose GET 'succeeded' against corrupt
             # or stale content, or one that failed before reporting,
@@ -4170,6 +4384,7 @@ class Scheduler(SchedulerInterface):
                 failed_block_ids=list(report.failed_block_ids),
                 plan_id=self._next_repair_plan_id,
                 report_evidence=self._report_evidence_key(report),
+                transfer_generation=report.transfer_generation,
             )
             self.recovery_plans[report.request_id] = plan
             skip_req_ids.add(report.request_id)
@@ -4336,7 +4551,11 @@ class Scheduler(SchedulerInterface):
         request from here. The engine stays alive: broken evidence
         invalidates the recovery attempt, not the request.
         """
-        self.recovery_plans.pop(request.request_id, None)
+        dissolved = self.recovery_plans.pop(request.request_id, None)
+        if dissolved is not None:
+            # The plan's evidence was superseded by this rejection: a
+            # late re-delivery of it is absorbed, not re-authorized.
+            self._remember_consumed_evidence(dissolved)
         well_formed = [
             r for r in reports if self._validate_load_failure_report(r) is None
         ]
@@ -4409,6 +4628,12 @@ class Scheduler(SchedulerInterface):
         plan.state = "REPAIRING"
         request = self.requests.get(result.request_id)
         self.recovery_plans.pop(result.request_id, None)
+        # The attempt's evidence reached its terminal disposition: a
+        # late re-delivery of the same (generation, evidence) is a
+        # duplicate of an outcome already known -- absorbed, never
+        # re-authorized. A genuine repeated failure is a NEW scheduled
+        # attempt with a NEW generation and is unaffected.
+        self._remember_consumed_evidence(plan)
         if request is None:
             # The request object is already gone (it finished before the
             # verdict arrived) -- nothing to restore or truncate.

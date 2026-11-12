@@ -587,6 +587,37 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def note_transfer_attempt(
+        self, request: "Request", transfer_generation: int
+    ) -> None:
+        """Notify the connector that a new external-KV load attempt was
+        scheduled for the request, together with its transfer identity.
+
+        Called at the moment the scheduler admits the request with
+        external computed tokens -- the moment the load attempt is
+        initiated (sync loads run in this step; async loads start now
+        and finish later). Connectors participating in the hole-repair
+        policy must capture the generation, carry it through their
+        broadcast transfer metadata, and echo it in every
+        KVLoadFailureReport and KVLoadAttestation the attempt produces:
+        the scheduler rejects evidence whose identity does not match
+        the request's latest scheduled attempt, which is what
+        distinguishes a late duplicate of a consumed attempt from a
+        genuine new failure.
+
+        The default implementation ignores the notification: connectors
+        that do not implement the repair policy are unaffected.
+
+        Args:
+            request (Request): the request whose external-KV load is
+                being initiated.
+            transfer_generation (int): the globally unique identity of
+                this load attempt (monotonic for the scheduler's
+                lifetime; never reused, across request-ID reuse too).
+
+        """
+        return
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

@@ -49,13 +49,34 @@ def _deliver_reports(scheduler, out, reports, reqs, attestations=None):
     output = create_model_runner_output(reqs=reqs, use_eos=False)
     if attestations is None:
         attestations = [
-            _terminal_attestation(req_id) for req_id in {r.request_id for r in reports}
+            _terminal_attestation(
+                req_id,
+                generation=scheduler._req_transfer_generation.get(req_id),
+            )
+            for req_id in {r.request_id for r in reports}
         ]
     output.kv_connector_output = KVConnectorOutput(
         load_failure_reports=reports,
         load_attestations=attestations,
     )
     scheduler.update_from_output(out, output)
+
+
+def _admit_sync_external_hits(scheduler, requests, num_tokens):
+    """One connector Mock answering a sync external hit for EVERY named
+    request (admitting two requests needs ONE Mock: a second
+    admit_sync_external_hit call would replace the first's side_effect
+    and silently strip the first request's claim, leaving it with no
+    transfer identity)."""
+    from unittest.mock import Mock
+
+    scheduler.connector = Mock()
+    wanted = set(requests)
+    scheduler.connector.get_num_new_matched_tokens.side_effect = (
+        lambda req, _: (num_tokens, False) if req in wanted else (0, False)
+    )
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
 
 
 def _sync_claim_scenario(scheduler=None, num_tokens=3328):
@@ -94,8 +115,7 @@ def test_report_ordering_does_not_matter():
     r2 = create_request(num_tokens=3328)
     scheduler.add_request(r1)
     scheduler.add_request(r2)
-    admit_sync_external_hit(scheduler, r1, 3072)
-    admit_sync_external_hit(scheduler, r2, 3072)
+    _admit_sync_external_hits(scheduler, [r1, r2], 3072)
     out1 = scheduler.schedule()
 
     reports_a = [
@@ -214,8 +234,7 @@ def test_multiple_requests_independent_failures():
     r2 = create_request(num_tokens=3328)
     scheduler.add_request(r1)
     scheduler.add_request(r2)
-    admit_sync_external_hit(scheduler, r1, 3072)
-    admit_sync_external_hit(scheduler, r2, 3072)
+    _admit_sync_external_hits(scheduler, [r1, r2], 3072)
     out1 = scheduler.schedule()
 
     good = _structured_report(scheduler, r1)

@@ -55,6 +55,16 @@ from vllm.v1.outputs import KVConnectorOutput
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
+def att(scheduler, request, **overrides):
+    """A conforming attestation for the request's latest scheduled
+    attempt (the generation stamped automatically)."""
+    return _terminal_attestation(
+        request.request_id,
+        generation=scheduler._req_transfer_generation.get(request.request_id),
+        **overrides,
+    )
+
+
 def make_tp_scheduler(tp_size: int):
     """A repair-policy scheduler whose evidence gate expects
     attestations from tp_size TP ranks, built through the REAL config
@@ -92,11 +102,15 @@ def deliver_evidence(scheduler, out, reqs, reports=(), attestations=()):
 
 def full_evidence(scheduler, request, *, report=None, tp_size=1, **att_overrides):
     """The conforming shape: a well-formed report plus one terminal,
-    fully certified attestation per TP rank."""
+    fully certified attestation per TP rank, all stamped with the
+    request's latest scheduled attempt identity."""
     if report is None:
         report = _structured_report(scheduler, request)
+    generation = scheduler._req_transfer_generation.get(request.request_id)
     attestations = [
-        _terminal_attestation(request.request_id, rank=r, **att_overrides)
+        _terminal_attestation(
+            request.request_id, rank=r, generation=generation, **att_overrides
+        )
         for r in range(tp_size)
     ]
     return report, attestations
@@ -129,7 +143,7 @@ def test_silent_rank_rejects_recovery_with_full_recompute_floor():
     only by the reporting rank is not certified on the silent rank."""
     scheduler, r1, out1 = sync_claim_scenario(tp_size=2)
     report = _structured_report(scheduler, r1)
-    rank0 = _terminal_attestation(r1.request_id, rank=0)
+    rank0 = att(scheduler, r1, rank=0)
     deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=[rank0])
 
     assert scheduler.recovery_plans == {}
@@ -158,8 +172,8 @@ def test_nonterminal_attestation_counts_as_missing():
     report = _structured_report(scheduler, r1)
     # Rank 0 terminal, rank 1 in flight.
     attestations = [
-        _terminal_attestation(r1.request_id, rank=0),
-        _terminal_attestation(r1.request_id, rank=1, terminal=False),
+        att(scheduler, r1, rank=0),
+        att(scheduler, r1, rank=1, terminal=False),
     ]
     deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=attestations)
     assert scheduler.recovery_plans == {}
@@ -186,9 +200,7 @@ def test_incomplete_object_set_fails_closed():
     report covers the difference). The structural battery rejects it;
     the whole external claim demotes to recompute-from-zero."""
     scheduler, r1, out1 = sync_claim_scenario()
-    attestation = _terminal_attestation(
-        r1.request_id, expected=192, loaded=191, certified=191
-    )
+    attestation = att(scheduler, r1, expected=192, loaded=191, certified=191)
     deliver_evidence(scheduler, out1, [r1], attestations=[attestation])
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 0
@@ -200,7 +212,7 @@ def test_divergent_manifest_fails_closed():
     key is exactly this shape) but no failure report accompanies it.
     Silent corruption is detected, not trusted."""
     scheduler, r1, out1 = sync_claim_scenario()
-    attestation = _terminal_attestation(r1.request_id, certified=191, cert_failures=1)
+    attestation = att(scheduler, r1, certified=191, cert_failures=1)
     deliver_evidence(scheduler, out1, [r1], attestations=[attestation])
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 0
@@ -217,8 +229,8 @@ def test_valid_failure_with_silent_corruption_on_peer_fails_closed():
     report = _structured_report(scheduler, r1)
     # The report is rank 0's evidence (aggregator-stamped).
     report.source_rank = 0
-    rank0 = _terminal_attestation(r1.request_id, rank=0)
-    rank1 = _terminal_attestation(r1.request_id, rank=1, certified=191, cert_failures=1)
+    rank0 = att(scheduler, r1, rank=0)
+    rank1 = att(scheduler, r1, rank=1, certified=191, cert_failures=1)
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[rank0, rank1]
     )
@@ -234,9 +246,7 @@ def test_failed_objects_with_matching_report_is_consistent():
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
     report.source_rank = 0
-    attestation = _terminal_attestation(
-        r1.request_id, loaded=191, failed=1, certified=191
-    )
+    attestation = att(scheduler, r1, loaded=191, failed=1, certified=191)
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[attestation]
     )
@@ -251,7 +261,7 @@ def test_certification_failure_with_matching_report_admits_plan_unhealthy():
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
     report.source_rank = 0
-    attestation = _terminal_attestation(r1.request_id, certified=191, cert_failures=1)
+    attestation = att(scheduler, r1, certified=191, cert_failures=1)
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[attestation]
     )
@@ -266,7 +276,7 @@ def test_duplicate_identical_attestations_are_absorbed():
     rank are absorbed, not treated as divergence."""
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
-    attestation = _terminal_attestation(r1.request_id)
+    attestation = att(scheduler, r1)
     deliver_evidence(
         scheduler,
         out1,
@@ -282,8 +292,8 @@ def test_divergent_attestations_from_one_rank_fail_closed():
     accounting: unattributable evidence. Fail closed."""
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
-    a = _terminal_attestation(r1.request_id)
-    b = _terminal_attestation(r1.request_id, certified=191)
+    a = att(scheduler, r1)
+    b = att(scheduler, r1, certified=191)
     deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=[a, b])
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == 0
@@ -303,10 +313,8 @@ def test_healthy_above_span_requires_every_ranks_certification():
     recomputed, never consumed as verified cache."""
     scheduler, r1, out1 = sync_claim_scenario(tp_size=2)
     report = _structured_report(scheduler, r1)
-    rank0 = _terminal_attestation(r1.request_id, rank=0)
-    rank1 = _terminal_attestation(
-        r1.request_id, rank=1, certification="none", certified=0
-    )
+    rank0 = att(scheduler, r1, rank=0)
+    rank1 = att(scheduler, r1, rank=1, certification="none", certified=0)
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[rank0, rank1]
     )
@@ -322,9 +330,7 @@ def test_size_only_certification_is_not_content_verification():
     the above-span claim is refused."""
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
-    attestation = _terminal_attestation(
-        r1.request_id, certification="size", certified=0
-    )
+    attestation = att(scheduler, r1, certification="size", certified=0)
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[attestation]
     )
@@ -340,7 +346,7 @@ def test_content_addressed_keys_honor_the_claim_under_store_trust():
     safety assumption, made explicit and enforceable."""
     scheduler, r1, out1 = sync_claim_scenario()
     report = _structured_report(scheduler, r1)
-    attestation = _terminal_attestation(r1.request_id, certification="content")
+    attestation = att(scheduler, r1, certification="content")
     deliver_evidence(
         scheduler, out1, [r1], reports=[report], attestations=[attestation]
     )
@@ -361,7 +367,7 @@ def test_all_ranks_healthy_no_reports_changes_nothing():
     flow owns it."""
     scheduler, r1, out1 = sync_claim_scenario(tp_size=2)
     computed_before = r1.num_computed_tokens
-    attestations = [_terminal_attestation(r1.request_id, rank=r) for r in range(2)]
+    attestations = [att(scheduler, r1, rank=r) for r in range(2)]
     deliver_evidence(scheduler, out1, [r1], attestations=attestations)
     assert scheduler.recovery_plans == {}
     assert r1.num_computed_tokens == computed_before
@@ -381,7 +387,7 @@ def test_rejected_claim_keeps_blocks_unpublished():
     block_pool = scheduler.kv_cache_manager.block_pool
 
     report = _structured_report(scheduler, r1)
-    rank0 = _terminal_attestation(r1.request_id, rank=0)
+    rank0 = att(scheduler, r1, rank=0)
     # TP=2, rank 1 silent.
     scheduler._evidence_tp_size = 2
     deliver_evidence(scheduler, out1, [r1], reports=[report], attestations=[rank0])
