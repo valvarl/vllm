@@ -236,6 +236,108 @@ class KVLoadFailureReport:
     # duplicates that differ only in this tag; the scheduler's evidence
     # comparison excludes it.
     source_rank: int | None = None
+    # The identity of the transfer attempt whose failure this report
+    # describes (see KVLoadAttestation.transfer_generation). Additive:
+    # None marks evidence from a connector that has not implemented
+    # the transfer-identity contract, which the repair policy's
+    # evidence gates reject.
+    transfer_generation: int | None = None
+
+
+@dataclass
+class KVLoadAttestation:
+    """One rank's positive, terminal statement about its portion of one
+    external-KV load attempt ('kv_load_failure_policy="repair"').
+
+    Reports are negative evidence: a rank that loaded everything
+    successfully reports NOTHING, so a silent rank -- one whose GET
+    'succeeded' against corrupt or stale content, or one that failed
+    before reporting -- is indistinguishable from a healthy one. This
+    attestation closes that gap: every rank that participated in a
+    transfer attempt positively attests its completion, its expected
+    object set, and the integrity certification it actually applied.
+    The scheduler refuses to authorize a recovery unless every rank of
+    the TP group supplied a terminal attestation: the missing /
+    incomplete / unverifiable state never authorizes.
+
+    Timing contract: identical to get_load_failure_reports(). Sync
+    loads attest in the forward pass of the transfer; async loads
+    attest no later than the pass in which the request is returned by
+    get_transfer_results().
+
+    Object counts are in the connector's own store-object units (the
+    per-rank, per-layer, per-block cells it GETs); the contract fixes
+    only the completeness arithmetic below, not the unit.
+    """
+
+    request_id: str
+    # The rank's expected object set size for this attempt: the
+    # complete set the transfer promised this rank, not only the
+    # subset a GET touched.
+    expected_objects: int
+    # Objects whose GET acknowledged bytes (includes the failed ones).
+    loaded_objects: int
+    # Objects whose GET failed; each must be covered by a failure
+    # report for the same request and generation.
+    failed_objects: int
+    # The integrity certification the connector actually applied to
+    # the loaded objects:
+    #  - "sha256": per-object digest certification against a
+    #    producer-recorded manifest (W2-ON).
+    #  - "content": content-addressed immutable keys -- GET success
+    #    implies correct content iff the store's key-to-data binding is
+    #    trustworthy (the store-trust assumption).
+    #  - "size": only length checks (no content verification).
+    #  - "none": no verification beyond GET success.
+    certification: str
+    # Objects that passed certification (0 when certification is
+    # "size"/"none": absence of proof, not a failure).
+    certified_objects: int
+    # Objects that FAILED certification: loaded bytes whose content
+    # provably diverges from the producer's manifest.
+    certification_failures: int
+    # True when the attempt is complete: no in-flight reads remain and
+    # the counts above are final for this generation.
+    terminal: bool
+    # The identity of the load attempt this attestation completes
+    # (echoed from the scheduler through the connector metadata). None
+    # marks a connector that has not implemented the transfer-identity
+    # contract.
+    transfer_generation: int | None = None
+    # Diagnostic only (AUTHORITATIVELY set by the TP output
+    # aggregator; a connector-supplied value is overwritten): the
+    # index of the attesting worker in the gathered per-rank outputs.
+    source_rank: int | None = None
+
+    def well_formed(self) -> bool:
+        """The structural invariants of a single attestation: a
+        terminal attestation must account for its complete expected
+        object set (loaded + failed == expected), its certified count
+        cannot exceed what it loaded, and a certification failure can
+        only appear alongside a certification capable of detecting it."""
+        if self.expected_objects < 0 or self.loaded_objects < 0:
+            return False
+        if self.terminal and (
+            self.loaded_objects + self.failed_objects != self.expected_objects
+        ):
+            return False
+        if self.certified_objects + self.certification_failures > self.loaded_objects:
+            return False
+        if self.certification_failures > 0:
+            return self.certification in ("sha256", "content")
+        return True
+
+    def certifies_content(self) -> bool:
+        """Whether this attestation independently proves content
+        identity for its FULL expected object set: a real certification
+        level ("sha256" or "content"), every expected object
+        certified, and zero failures."""
+        if self.certification not in ("sha256", "content"):
+            return False
+        return (
+            self.certification_failures == 0
+            and self.certified_objects == self.expected_objects
+        )
 
 
 @dataclass
@@ -293,6 +395,12 @@ class KVConnectorOutput:
     # the hole-repair policy (``kv_load_failure_policy="repair"``). Absent
     # or empty for every other connector: behavior is byte-identical.
     load_failure_reports: list[KVLoadFailureReport] | None = None
+    # Positive per-rank transfer attestations (the hole-repair policy's
+    # completeness evidence): one terminal KVLoadAttestation per rank
+    # per completed load attempt, produced even when the rank loaded
+    # everything successfully. Absent or empty for connectors that do
+    # not implement the attestation contract.
+    load_attestations: list[KVLoadAttestation] | None = None
     # The repair-only step's commit verdicts (one per repair work item).
     # None on every ordinary step.
     repair_results: list[RepairResultReport] | None = None
@@ -312,6 +420,7 @@ class KVConnectorOutput:
             and not self.invalid_block_ids
             and not self.failed_recving
             and not self.load_failure_reports
+            and not self.load_attestations
             and not self.repair_results
             and not self.kv_connector_worker_meta
         )

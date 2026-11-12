@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.outputs import (
     KVConnectorOutput,
+    KVLoadAttestation,
     KVLoadFailureReport,
     ModelRunnerOutput,
     RepairResultReport,
@@ -107,6 +108,12 @@ class KVOutputAggregator:
         # the correct merge.
         load_failure_reports: list[KVLoadFailureReport] = []
         repair_results: list[RepairResultReport] = []
+        # Positive transfer attestations (the hole-repair policy's
+        # completeness evidence): unlike reports, one per rank per
+        # attempt even on success. Concatenation is the merge here as
+        # well: the scheduler's evidence gate groups by request and
+        # requires one terminal attestation per TP rank.
+        load_attestations: list[KVLoadAttestation] = []
         for rank, model_runner_output in enumerate(outputs):
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -184,6 +191,17 @@ class KVOutputAggregator:
                 report.source_rank = rank
             load_failure_reports.extend(kv_output.load_failure_reports or [])
             repair_results.extend(kv_output.repair_results or [])
+            for attestation in kv_output.load_attestations or []:
+                # Rank attribution, AUTHORITATIVE for the same reason as
+                # the reports' stamp (the final audit's FA-2): the
+                # aggregator is the only component that knows which
+                # output came from which rank, so a connector-supplied
+                # source_rank is always overwritten -- an attesting
+                # connector must not be able to impersonate another
+                # rank in the completeness gate or the divergence
+                # diagnostics.
+                attestation.source_rank = rank
+            load_attestations.extend(kv_output.load_attestations or [])
 
         failed_recving = self._failed_recving_pending & finished_recving
         self._failed_recving_pending -= failed_recving
@@ -202,6 +220,7 @@ class KVOutputAggregator:
             failed_recving=failed_recving,
             expected_finished_count=self._expected_finished_count,
             load_failure_reports=load_failure_reports or None,
+            load_attestations=load_attestations or None,
             repair_results=repair_results or None,
         )
 

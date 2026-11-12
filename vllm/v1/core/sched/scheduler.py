@@ -71,6 +71,7 @@ from vllm.v1.metrics.stats import (
 from vllm.v1.outputs import (
     DraftTokenIds,
     KVConnectorOutput,
+    KVLoadAttestation,
     KVLoadFailureReport,
     ModelRunnerOutput,
     RepairResultReport,
@@ -221,6 +222,16 @@ class Scheduler(SchedulerInterface):
         # were left unpublished at admission under the repair policy;
         # published at the step's update once the delivery verdict is known.
         self._delayed_sync_claim_pubs: set[str] = set()
+        # Positive transfer evidence (the hole-repair policy's
+        # completeness gate): the number of TP ranks whose terminal
+        # attestation a recovery authorization requires. A silent rank
+        # -- one whose GET 'succeeded' against corrupt or stale content,
+        # or one that failed before reporting -- supplies no report at
+        # all, so reports alone cannot distinguish 'all ranks verified
+        # their portion' from 'one rank verified and the rest said
+        # nothing'. With PP>1 the repair policy is TP-scoped:
+        # attestations are required from the TP group's ranks only.
+        self._evidence_tp_size = vllm_config.parallel_config.tensor_parallel_size
         # Transactional publication: request ids whose repair-step
         # admissions were left unpublished at allocate_slots; they publish
         # ONLY on the step's accepted verdict, never on abort/missing/stale.
@@ -2374,9 +2385,15 @@ class Scheduler(SchedulerInterface):
 
         failed_kv_load_req_ids: set[str] = set()
         repair_dispositions: dict[str, str] = {}
-        if kv_connector_output and kv_connector_output.load_failure_reports:
+        if kv_connector_output and (
+            kv_connector_output.load_failure_reports
+            or kv_connector_output.load_attestations
+        ):
             failed_kv_load_req_ids.update(
-                self._handle_repair_reports(kv_connector_output.load_failure_reports)
+                self._handle_repair_evidence(
+                    kv_connector_output.load_failure_reports,
+                    kv_connector_output.load_attestations,
+                )
             )
         if kv_connector_output and kv_connector_output.repair_results:
             # The repair step's verdicts, one per admitted work item. TP
@@ -3796,7 +3813,204 @@ class Scheduler(SchedulerInterface):
             report.restored_extent,
         )
 
-    def _handle_repair_reports(self, reports: list[KVLoadFailureReport]) -> set[str]:
+    def _handle_repair_evidence(
+        self,
+        reports: list[KVLoadFailureReport] | None,
+        attestations: list[KVLoadAttestation] | None,
+    ) -> set[str]:
+        """Consume the step's structured transfer evidence under the
+        repair policy: the negative half (failure reports) plus the
+        positive half (per-rank transfer attestations).
+
+        The attestation pass runs first and INDEPENDENTLY of the
+        reports: violations of the positive contract -- malformed
+        accounting, divergent attestations from one rank, or a rank
+        that attests failed or certification-failed objects without
+        the matching report -- fail the request closed to the
+        recompute fallback even when the reports look clean. A rank's
+        silence about its own corruption is exactly what the
+        attestation exists to catch (the silent-rank gap).
+
+        The report pass then requires, for every request it would
+        authorize, terminal attestations from EVERY rank of the TP
+        group: incomplete evidence never authorizes a recovery.
+        """
+        reports = reports or []
+        attestations = attestations or []
+        if not self.repair_kv_load_failures:
+            policy = self.vllm_config.kv_transfer_config.kv_load_failure_policy
+            what = "load_failure_reports" if reports else "load_attestations"
+            raise RuntimeError(
+                "A KV connector reported " + what + " while "
+                f"kv_load_failure_policy={policy!r}; the repair policy "
+                "is required to consume transfer evidence."
+            )
+        reports_by_request: dict[str, list[KVLoadFailureReport]] = {}
+        for report in reports:
+            reports_by_request.setdefault(report.request_id, []).append(report)
+        attest_by_request: dict[str, list[KVLoadAttestation]] = {}
+        for attestation in attestations:
+            attest_by_request.setdefault(attestation.request_id, []).append(attestation)
+        skip_req_ids = self._check_transfer_attestations(
+            reports_by_request, attest_by_request
+        )
+        skip_req_ids |= self._handle_repair_reports(
+            reports, attest_by_request, evidence_failed=skip_req_ids
+        )
+        return skip_req_ids
+
+    def _check_transfer_attestations(
+        self,
+        reports_by_request: dict[str, list[KVLoadFailureReport]],
+        attest_by_request: dict[str, list[KVLoadAttestation]],
+    ) -> set[str]:
+        """Validate the step's POSITIVE transfer evidence.
+
+        Returns the request ids whose evidence failed closed; each such
+        request truncates to rollback 0 (no attestation vouches for any
+        span of the external claim) and the ordinary
+        rollback-recompute path owns it. These are connector contract
+        violations, not ordinary load failures: loud, monitored, and
+        engine-survivable.
+        """
+        skip_req_ids: set[str] = set()
+        for req_id, request_attestations in attest_by_request.items():
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            request_reports = reports_by_request.get(req_id, [])
+            reason = self._attestation_violation(
+                request, request_attestations, request_reports
+            )
+            if reason is not None:
+                self._reject_uninterpretable_reports(
+                    request,
+                    request_reports,
+                    reason,
+                    skip_req_ids,
+                    trusted_rollback=0,
+                )
+        return skip_req_ids
+
+    def _attestation_violation(
+        self,
+        request: Request,
+        request_attestations: list[KVLoadAttestation],
+        request_reports: list[KVLoadFailureReport],
+    ) -> str | None:
+        """Whether the request's attestations violate the positive
+        evidence contract. Returns a human-readable rejection reason,
+        or None when the attestations are well-formed, per-rank
+        consistent, and (where terminal) reconciled with the failure
+        reports. The caller owns the failure mode."""
+        # The structural battery: terminal accounting must cover the
+        # complete expected object set (loaded + failed == expected), a
+        # rank cannot certify more than it loaded, and a certification
+        # failure requires a certification capable of detecting it.
+        for attestation in request_attestations:
+            if not attestation.well_formed():
+                return (
+                    "malformed attestation accounting from rank "
+                    f"{attestation.source_rank} (expected="
+                    f"{attestation.expected_objects} loaded="
+                    f"{attestation.loaded_objects} failed="
+                    f"{attestation.failed_objects} terminal="
+                    f"{attestation.terminal})"
+                )
+        # Per-rank identity: one rank, one attestation per attempt.
+        # Identical duplicates are absorbed; divergent content from one
+        # rank is unattributable evidence and fails closed.
+        by_rank: dict[int | None, list[KVLoadAttestation]] = {}
+        for attestation in request_attestations:
+            by_rank.setdefault(attestation.source_rank, []).append(attestation)
+        for rank, rank_attestations in by_rank.items():
+            first = rank_attestations[0]
+            for other in rank_attestations[1:]:
+                diverged = (
+                    other.transfer_generation,
+                    other.expected_objects,
+                    other.loaded_objects,
+                    other.failed_objects,
+                    other.certification,
+                    other.certified_objects,
+                    other.certification_failures,
+                    other.terminal,
+                ) != (
+                    first.transfer_generation,
+                    first.expected_objects,
+                    first.loaded_objects,
+                    first.failed_objects,
+                    first.certification,
+                    first.certified_objects,
+                    first.certification_failures,
+                    first.terminal,
+                )
+                if diverged:
+                    return (
+                        f"divergent attestations from rank {rank} for one "
+                        "request and attempt"
+                    )
+        # A terminal attestation that observed failures or
+        # certification failures must be accompanied by THAT RANK'S
+        # structured failure evidence in the same step: reports are
+        # per-rank statements (the aggregator stamps each with its
+        # originating worker), and a peer's report does not cover a
+        # rank's own corrupt cells. A rank whose connector detected
+        # corrupt or missing content and reported nothing -- while a
+        # peer's clean-looking report arrives -- is exactly the
+        # silent-corruption shape this contract exists to catch.
+        reported_ranks = {r.source_rank for r in request_reports}
+        for attestation in request_attestations:
+            if not attestation.terminal:
+                continue
+            if attestation.source_rank in reported_ranks:
+                continue
+            if attestation.failed_objects > 0:
+                return (
+                    f"rank {attestation.source_rank} attests "
+                    f"{attestation.failed_objects} failed objects "
+                    "without its own failure report"
+                )
+            if attestation.certification_failures > 0:
+                return (
+                    f"rank {attestation.source_rank} attests "
+                    f"{attestation.certification_failures} certification "
+                    "failures without its own failure report"
+                )
+        return None
+
+    def _transfer_evidence_complete(
+        self, request_attestations: list[KVLoadAttestation]
+    ) -> str | None:
+        """The completeness gate: whether every rank of the TP group
+        supplied a terminal, well-formed attestation for this request.
+        Returns a rejection reason naming the shortfall, or None when
+        complete. Reports are negative evidence -- a rank whose GET
+        'succeeded' against corrupt or stale content reports nothing at
+        all -- so only the positive attestations can prove that every
+        participating rank completed and verified its portion."""
+        terminal_ranks: set[int] = set()
+        for attestation in request_attestations:
+            if (
+                attestation.terminal
+                and attestation.well_formed()
+                and attestation.source_rank is not None
+            ):
+                terminal_ranks.add(attestation.source_rank)
+        if len(terminal_ranks) < self._evidence_tp_size:
+            return (
+                f"incomplete transfer evidence: {len(terminal_ranks)} of "
+                f"{self._evidence_tp_size} TP ranks supplied a terminal "
+                "attestation for the request"
+            )
+        return None
+
+    def _handle_repair_reports(
+        self,
+        reports: list[KVLoadFailureReport],
+        attest_by_request: dict[str, list[KVLoadAttestation]] | None = None,
+        evidence_failed: set[str] | None = None,
+    ) -> set[str]:
         """Consume structured load-failure reports under the repair policy.
 
         Two passes per request. The consensus pass groups the step's
@@ -3807,18 +4021,18 @@ class Scheduler(SchedulerInterface):
         regions, or the same region with different metadata -- is never
         merged and never authorizes a recovery: the request falls back to
         the ordinary rollback-recompute path (see
-        _reject_uninterpretable_reports) and the engine stays alive. The
-        install pass is unchanged: truncate to the rollback boundary,
-        install the RecoveryPlan, and return the ids whose (garbage)
-        outputs from the detection step must be skipped.
+        _reject_uninterpretable_reports) and the engine stays alive.
+        Before any plan is admitted, the completeness gate requires
+        terminal attestations from every TP rank (the positive half of
+        the evidence contract, checked in _transfer_evidence_complete):
+        failure reports alone cannot prove that a silent rank holds
+        healthy KV. The install pass is otherwise unchanged: truncate
+        to the rollback boundary, install the RecoveryPlan, and return
+        the ids whose (garbage) outputs from the detection step must be
+        skipped.
         """
-        if not self.repair_kv_load_failures:
-            policy = self.vllm_config.kv_transfer_config.kv_load_failure_policy
-            raise RuntimeError(
-                "A KV connector reported load_failure_reports while "
-                f"kv_load_failure_policy={policy!r}; the repair policy "
-                "is required to consume reports."
-            )
+        attest_by_request = attest_by_request or {}
+        evidence_failed = evidence_failed or set()
         skip_req_ids: set[str] = set()
         by_request: dict[str, list[KVLoadFailureReport]] = {}
         for report in reports:
@@ -3826,6 +4040,14 @@ class Scheduler(SchedulerInterface):
         for req_id, req_reports in by_request.items():
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
+                continue
+            if req_id in evidence_failed:
+                # The attestation pass already failed this request
+                # closed this step: its positive evidence violated the
+                # contract. A report arriving in the same step must not
+                # resurrect an authorization on top of evidence that
+                # was just rejected.
+                skip_req_ids.add(req_id)
                 continue
             if req_id in self.recovery_plans:
                 # A plan already owns this request. Reports matching the
@@ -3874,6 +4096,26 @@ class Scheduler(SchedulerInterface):
                 continue
             report = unique[0]
             request = self.requests[report.request_id]
+            # The completeness gate: failure reports are negative
+            # evidence -- a rank whose GET 'succeeded' against corrupt
+            # or stale content, or one that failed before reporting,
+            # supplies no report at all. A recovery may be authorized
+            # only when EVERY rank of the TP group supplied a terminal,
+            # well-formed attestation for this request. Incomplete
+            # evidence fails closed to the recompute fallback (the
+            # engine stays alive); it never blocks on waiting for
+            # stragglers. The rollback floor is ZERO, not the report's
+            # boundary: TP attention reads every rank's shard, so a
+            # prefix boundary certified by one rank's report is not
+            # certified on a silent rank's shard -- the external claim
+            # as a whole demotes to a full recompute.
+            request_attestations = attest_by_request.get(req_id, [])
+            gate = self._transfer_evidence_complete(request_attestations)
+            if gate is not None:
+                self._reject_uninterpretable_reports(
+                    request, req_reports, gate, skip_req_ids, trusted_rollback=0
+                )
+                continue
             rollback, corrupt_end = (
                 report.rollback_boundary,
                 report.token_span[1],
@@ -3896,6 +4138,25 @@ class Scheduler(SchedulerInterface):
             # for in-flight steps whose outputs are now suppressed.
             request.num_output_placeholders = 0
             layer_end = max(report.observed_failed_layers) + 1
+            # The global above-span trust gate: the report's
+            # healthy_above_span is ONE RANK's certification of ITS OWN
+            # above-span cells, but the commit decision consumes it for
+            # every rank's extent. The claim is honored only when every
+            # rank's terminal attestation independently proves content
+            # identity for its full expected object set
+            # (KVLoadAttestation.certifies_content: a real certification
+            # level -- per-object digest ("sha256") or content-addressed
+            # immutable keys under the store-trust assumption
+            # ("content") -- with every object certified and zero
+            # failures). Otherwise the plan carries False and the
+            # commit caps the restoration at the repair span's end:
+            # the untrusted above-span extent is recomputed, never
+            # consumed as verified cache.
+            healthy_above_span = report.healthy_above_span and all(
+                attestation.certifies_content()
+                for attestation in request_attestations
+                if attestation.terminal
+            )
             self._next_repair_plan_id += 1
             plan = RecoveryPlan(
                 request_id=report.request_id,
@@ -3905,7 +4166,7 @@ class Scheduler(SchedulerInterface):
                 ),
                 layer_end=layer_end,
                 restored_extent=report.restored_extent,
-                healthy_above_span=report.healthy_above_span,
+                healthy_above_span=healthy_above_span,
                 failed_block_ids=list(report.failed_block_ids),
                 plan_id=self._next_repair_plan_id,
                 report_evidence=self._report_evidence_key(report),
@@ -3923,7 +4184,7 @@ class Scheduler(SchedulerInterface):
                 layer_end,
                 plan.est_equivalent_tokens,
                 report.restored_extent,
-                report.healthy_above_span,
+                healthy_above_span,
             )
         return skip_req_ids
 

@@ -26,6 +26,7 @@ from tests.v1.core.test_scheduler_repair_budget import (
     BS,
     _deliver_report,
     _structured_report,
+    _terminal_attestation,
     admit_sync_external_hit,
     make_scheduler,
 )
@@ -35,13 +36,25 @@ from vllm.v1.outputs import KVConnectorOutput
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
-def _deliver_reports(scheduler, out, reports, reqs):
+def _deliver_reports(scheduler, out, reports, reqs, attestations=None):
     """update_from_output carrying an AGGREGATED report list (the shape
-    the TP output aggregator produces: one entry per reporting rank)."""
+    the TP output aggregator produces: one entry per reporting rank)
+    plus the CONFORMING positive evidence: a terminal, fully certified
+    attestation per request (the fixture scheduler is TP=1, so the
+    completeness gate requires exactly one per request). Tests
+    exercising the incomplete-evidence shapes pass their own (or no)
+    attestations."""
     from tests.v1.kv_connector.unit.utils import create_model_runner_output
 
     output = create_model_runner_output(reqs=reqs, use_eos=False)
-    output.kv_connector_output = KVConnectorOutput(load_failure_reports=reports)
+    if attestations is None:
+        attestations = [
+            _terminal_attestation(req_id) for req_id in {r.request_id for r in reports}
+        ]
+    output.kv_connector_output = KVConnectorOutput(
+        load_failure_reports=reports,
+        load_attestations=attestations,
+    )
     scheduler.update_from_output(out, output)
 
 
@@ -98,9 +111,14 @@ def test_report_ordering_does_not_matter():
 
 def test_one_rank_reporting_alone_installs_plan():
     """A rank-asymmetric fault (only one rank observed the failed load)
-    is still genuine evidence: the single report installs the plan. The
-    repair replays the span on EVERY rank, so a silent majority is not
-    a divergence."""
+    is still genuine evidence WHEN THAT RANK ALSO ATTESTS its terminal,
+    verified completion of the whole attempt (the fixture scheduler is
+    TP=1, so its own attestation completes the evidence): the single
+    report installs the plan. The repair replays the span on EVERY
+    rank, so a silent majority is not a divergence -- but silence is
+    only tolerated when the positive evidence proves the missing ranks
+    completed and verified their portions (see
+    test_scheduler_transfer_evidence for the silent-rank rejection)."""
     scheduler, r1, out1 = _sync_claim_scenario()
     _deliver_reports(scheduler, out1, [_structured_report(scheduler, r1)], reqs=[r1])
     assert r1.request_id in scheduler.recovery_plans

@@ -26,7 +26,12 @@ from tests.v1.kv_connector.unit.utils import (
     create_vllm_config,
 )
 from vllm.v1.core.sched.scheduler import RecoveryPlan, Scheduler
-from vllm.v1.outputs import KVConnectorOutput, KVLoadFailureReport, RepairResultReport
+from vllm.v1.outputs import (
+    KVConnectorOutput,
+    KVLoadAttestation,
+    KVLoadFailureReport,
+    RepairResultReport,
+)
 from vllm.v1.request import Request, RequestStatus
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
@@ -259,7 +264,12 @@ def test_report_arm_installs_plan_and_skips_detection_output():
         restored_extent=3072,
     )
     output = create_model_runner_output(reqs=[r1], use_eos=False)
-    output.kv_connector_output = KVConnectorOutput(load_failure_reports=[report])
+    output.kv_connector_output = KVConnectorOutput(
+        load_failure_reports=[report],
+        # The conforming positive half of the evidence: the reporting
+        # rank's terminal, fully certified attestation (TP=1 fixture).
+        load_attestations=[_terminal_attestation(r1.request_id)],
+    )
     n_output_tokens_before = len(r1.output_token_ids)
     scheduler.update_from_output(out1, output)
 
@@ -399,9 +409,50 @@ def _structured_report(scheduler, r1, failed_block_idx=96, **overrides):
     return KVLoadFailureReport(**fields)
 
 
-def _deliver_report(scheduler, r1, out, report, reqs=None):
+def _terminal_attestation(
+    request_id,
+    *,
+    rank=0,
+    expected=192,
+    loaded=192,
+    failed=0,
+    certification="sha256",
+    certified=192,
+    cert_failures=0,
+    terminal=True,
+    **overrides,
+):
+    """A conforming per-rank attestation: terminal, accounting for the
+    complete expected object set, with full SHA certification. 192
+    objects = the fixture's 3072-token external claim at BS=16."""
+    fields = dict(
+        request_id=request_id,
+        expected_objects=expected,
+        loaded_objects=loaded,
+        failed_objects=failed,
+        certification=certification,
+        certified_objects=certified,
+        certification_failures=cert_failures,
+        terminal=terminal,
+        source_rank=rank,
+    )
+    fields.update(overrides)
+    return KVLoadAttestation(**fields)
+
+
+def _deliver_report(scheduler, r1, out, report, reqs=None, attestations=None):
+    """Deliver a report through update_from_output with the CONFORMING
+    evidence shape: a terminal attestation accompanies the report (the
+    fixture scheduler is TP=1), so the completeness gate sees complete
+    evidence. Tests exercising the incomplete-evidence shapes pass
+    their own (or no) attestations."""
     output = create_model_runner_output(reqs=reqs or [r1], use_eos=False)
-    output.kv_connector_output = KVConnectorOutput(load_failure_reports=[report])
+    if attestations is None:
+        attestations = [_terminal_attestation(r1.request_id)]
+    output.kv_connector_output = KVConnectorOutput(
+        load_failure_reports=[report],
+        load_attestations=attestations,
+    )
     scheduler.update_from_output(out, output)
 
 

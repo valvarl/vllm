@@ -108,6 +108,7 @@ class KVConnectorModelRunnerMixin:
             output.failed_recving = transfer_results.failed_recving
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
             output.load_failure_reports = kv_connector.get_load_failure_reports()
+            output.load_attestations = kv_connector.get_load_attestations()
 
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()

@@ -6,6 +6,7 @@ import pytest
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.v1.outputs import (
     KVConnectorOutput,
+    KVLoadAttestation,
     KVLoadFailureReport,
     ModelRunnerOutput,
     RepairResultReport,
@@ -24,6 +25,7 @@ class DummyModelRunnerOutput(ModelRunnerOutput):
         expected_finished_count: int = 0,
         load_failure_reports: list[KVLoadFailureReport] | None = None,
         repair_results: list[RepairResultReport] | None = None,
+        load_attestations: list[KVLoadAttestation] | None = None,
     ):
         self.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
@@ -32,6 +34,7 @@ class DummyModelRunnerOutput(ModelRunnerOutput):
             failed_recving=failed_recving or set(),
             expected_finished_count=expected_finished_count,
             load_failure_reports=load_failure_reports,
+            load_attestations=load_attestations,
             repair_results=repair_results,
         )
 

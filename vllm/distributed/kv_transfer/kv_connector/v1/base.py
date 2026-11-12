@@ -51,7 +51,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput, KVLoadFailureReport
+from vllm.v1.outputs import KVConnectorOutput, KVLoadAttestation, KVLoadFailureReport
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -437,6 +437,32 @@ class KVConnectorBase_V1(ABC):
         Returns:
             List of failure reports. Empty for connectors that do not
             support hole repair.
+
+        """
+        return []
+
+    def get_load_attestations(self) -> list[KVLoadAttestation]:
+        """Get positive per-rank attestations of completed load attempts.
+
+        Attestations are the completeness half of the hole-repair
+        policy's evidence contract: failure reports are negative
+        evidence (a rank that loaded everything successfully reports
+        nothing), so a silent rank is indistinguishable from a healthy
+        one without this positive statement. A conforming
+        repair-policy connector produces one TERMINAL
+        KVLoadAttestation per rank per load attempt -- including
+        attempts that loaded everything successfully -- carrying the
+        attempt's transfer generation, the rank's complete expected
+        object set, its completion accounting, and the integrity
+        certification it actually applied. The timing contract is
+        identical to get_load_failure_reports(): sync loads attest in
+        the forward pass of the transfer, async loads attest no later
+        than the pass in which the request is returned by
+        get_transfer_results().
+
+        Returns:
+            List of attestations. Empty for connectors that do not
+            implement the attestation contract.
 
         """
         return []
